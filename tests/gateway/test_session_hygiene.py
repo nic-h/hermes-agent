@@ -396,12 +396,10 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_warns_user_when_compression_aborts(monkeypatch, tmp_path):
+async def test_session_hygiene_logs_only_when_compression_aborts(monkeypatch, tmp_path, caplog):
     """When auxiliary compression's summary LLM call fails, the compressor
-    ABORTS — returns messages unchanged, sets _last_compress_aborted=True,
-    and drops nothing.  Gateway must surface a visible ⚠️ warning to the
-    user (including thread_id metadata so it lands in the originating
-    topic/thread) saying the conversation is unchanged and how to retry."""
+    aborts without dropping messages. Gateway must log the issue without
+    posting compressor internals to the user thread."""
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -480,6 +478,7 @@ async def test_session_hygiene_warns_user_when_compression_aborts(monkeypatch, t
         lambda *_args, **_kwargs: 100,
     )
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "795544298")
+    caplog.set_level("WARNING", logger="gateway.run")
 
     event = MessageEvent(
         text="hello",
@@ -496,31 +495,19 @@ async def test_session_hygiene_warns_user_when_compression_aborts(monkeypatch, t
     result = await runner._handle_message(event)
 
     assert result == "ok"
-    # The compressor reported abort → exactly one warning message must
-    # have been delivered to the user.
-    warning_messages = [s for s in adapter.sent if "Context compression aborted" in s["content"]]
-    assert len(warning_messages) == 1, (
-        f"Expected 1 compression-aborted warning, got {len(warning_messages)}: {adapter.sent}"
-    )
-    warn = warning_messages[0]
-    # Warning must include the underlying error and tell the user nothing
-    # was dropped.
-    assert "404" in warn["content"]
-    assert "No messages were dropped" in warn["content"]
-    # Warning must land in the originating topic/thread, not the main channel.
-    assert warn["chat_id"] == "-1001"
-    assert warn["metadata"] == {"thread_id": "17585"}
+    warning_messages = [s for s in adapter.sent if "Context compression" in s["content"]]
+    assert warning_messages == []
+    assert "Session hygiene compression aborted" in caplog.text
+    assert "messages unchanged" in caplog.text
+    assert "404 model not found" in caplog.text
 
     FakeCompressAgentWithSummaryFailure.last_instance.close.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_informs_user_when_aux_model_fails_but_recovers(monkeypatch, tmp_path):
-    """When the user's configured ``auxiliary.compression.model`` errors out
-    and we recover via the main model, compression succeeds but the user's
-    config is still broken.  Gateway hygiene must surface an ℹ note so the
-    user knows to fix ``auxiliary.compression.model`` — silent recovery
-    hides a misconfig only they can resolve."""
+async def test_session_hygiene_logs_only_when_aux_model_fails_but_recovers(monkeypatch, tmp_path, caplog):
+    """When the configured aux compression model fails and main-model fallback works,
+    gateway hygiene should log the recovery without posting internals to chat."""
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -600,6 +587,7 @@ async def test_session_hygiene_informs_user_when_aux_model_fails_but_recovers(mo
         lambda *_args, **_kwargs: 100,
     )
     monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "795544298")
+    caplog.set_level("WARNING", logger="gateway.run")
 
     event = MessageEvent(
         text="hello",
@@ -619,21 +607,15 @@ async def test_session_hygiene_informs_user_when_aux_model_fails_but_recovers(mo
     # No ⚠️ hard-failure warning (that's for dropped turns)
     hard_warnings = [s for s in adapter.sent if "Context compression summary failed" in s["content"]]
     assert len(hard_warnings) == 0, adapter.sent
-    # But an ℹ note about the configured aux model must be delivered.
+    # Aux-model recovery stays in logs; do not pollute the user thread.
     aux_notes = [
         s for s in adapter.sent
         if "Configured compression model" in s["content"]
     ]
-    assert len(aux_notes) == 1, (
-        f"Expected 1 aux-model fallback notice, got {len(aux_notes)}: {adapter.sent}"
-    )
-    note = aux_notes[0]
-    assert "gemini-3-flash-preview" in note["content"]
-    assert "404" in note["content"]
-    assert "auxiliary.compression.model" in note["content"]
-    # Note must land in the originating topic/thread.
-    assert note["chat_id"] == "-1001"
-    assert note["metadata"] == {"thread_id": "17585"}
+    assert aux_notes == []
+    assert "configured compression model" in caplog.text.lower()
+    assert "gemini-3-flash-preview" in caplog.text
+    assert "404 model not found" in caplog.text
 
     FakeCompressAgentWithAuxRecovery.last_instance.close.assert_called_once()
 
