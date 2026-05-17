@@ -1225,6 +1225,20 @@ class TestDoctorXaiOAuthStatus:
         assert "(not logged in)" in out
 
 
+def test_run_doctor_does_not_promote_inactive_gemini_key_to_issue(monkeypatch, tmp_path):
+    out = _run_doctor_with_healthy_oauth_fallback(
+        monkeypatch,
+        tmp_path,
+        env_key="GOOGLE_API_KEY",
+        bad_key="bad-gemini-key",
+        failing_host="googleapis.com",
+        gemini_oauth_status={},
+        minimax_oauth_status={},
+    )
+
+    assert "invalid API key" in out
+    assert "Check GOOGLE_API_KEY in .env" not in out
+
 # ---------------------------------------------------------------------------
 # ◆ Auth Providers — codex CLI import hint placement (issue #27975)
 # ---------------------------------------------------------------------------
