@@ -451,15 +451,8 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
     For paths like: ~/.hermes/skills/mlops/axolotl/SKILL.md -> "mlops"
     Also works for external skill dirs configured via skills.external_dirs.
     """
-    # Try the module-level SKILLS_DIR first (respects monkeypatching in tests),
-    # then fall back to external dirs from config.
-    dirs_to_check = [SKILLS_DIR]
-    try:
-        from agent.skill_utils import get_external_skills_dirs
-        dirs_to_check.extend(get_external_skills_dirs())
-    except Exception:
-        pass
-    for skills_dir in dirs_to_check:
+    # Try all known skill roots in precedence order: profile, external, bundled fallback.
+    for skills_dir in _skill_search_dirs():
         try:
             rel_path = skill_path.relative_to(skills_dir)
             parts = rel_path.parts
@@ -547,6 +540,53 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
+def _bundled_skills_dir() -> Optional[Path]:
+    """Return the repo/package bundled skills dir when available."""
+    override = os.getenv("HERMES_BUNDLED_SKILLS", "").strip()
+    bundled = Path(override).expanduser() if override else Path(__file__).resolve().parents[1] / "skills"
+    return bundled if bundled.is_dir() else None
+
+
+def _should_include_bundled_skills() -> bool:
+    """Only include bundled fallback for the real profile skills dir.
+
+    Tests often monkeypatch ``SKILLS_DIR`` to a tmpdir; including the checkout's
+    bundled catalog there would make empty-dir tests see hundreds of skills.
+    """
+    try:
+        return SKILLS_DIR.resolve() == (get_hermes_home() / "skills").resolve()
+    except Exception:
+        return False
+
+
+def _skill_search_dirs(*, include_bundled: bool = True) -> List[Path]:
+    """Return skill roots in precedence order: profile, external, bundled fallback."""
+    from agent.skill_utils import get_external_skills_dirs
+
+    dirs: List[Path] = []
+    if SKILLS_DIR.exists():
+        dirs.append(SKILLS_DIR)
+    dirs.extend(get_external_skills_dirs())
+
+    if include_bundled and _should_include_bundled_skills():
+        bundled = _bundled_skills_dir()
+        if bundled is not None:
+            dirs.append(bundled)
+
+    result: List[Path] = []
+    seen: set[Path] = set()
+    for root in dirs:
+        try:
+            key = root.resolve()
+        except Exception:
+            key = root
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(root)
+    return result
+
+
 def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
@@ -558,7 +598,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     Returns:
         List of skill metadata dicts (name, description, category).
     """
-    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from agent.skill_utils import iter_skill_index_files
 
     skills = []
     seen_names: set = set()
@@ -566,11 +606,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # Load disabled set once (not per-skill)
     disabled = set() if skip_disabled else _get_disabled_skill_names()
 
-    # Scan local dir first, then external dirs (local takes precedence)
-    dirs_to_scan = []
-    if SKILLS_DIR.exists():
-        dirs_to_scan.append(SKILLS_DIR)
-    dirs_to_scan.extend(get_external_skills_dirs())
+    # Scan profile, external dirs, then bundled fallback (profile wins by seen_names).
+    dirs_to_scan = _skill_search_dirs()
 
     for scan_dir in dirs_to_scan:
         for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
@@ -937,13 +974,24 @@ def skill_view(
             if bare:
                 local_category_name = f"{namespace}/{bare}"
 
-        from agent.skill_utils import get_external_skills_dirs
+        from agent.skill_utils import iter_skill_index_files
 
-        # Build list of all skill directories to search
-        all_dirs = []
-        if SKILLS_DIR.exists():
-            all_dirs.append(SKILLS_DIR)
-        all_dirs.extend(get_external_skills_dirs())
+        # Search profile/external dirs first. Bundled repo skills are a fallback
+        # so removing a byte-identical profile copy does not break exact
+        # skill_view("name"), while user/external overrides still win.
+        primary_dirs = _skill_search_dirs(include_bundled=False)
+        bundled_dirs: List[Path] = []
+        if _should_include_bundled_skills():
+            bundled = _bundled_skills_dir()
+            if bundled is not None:
+                try:
+                    primary_keys = {d.resolve() for d in primary_dirs}
+                    if bundled.resolve() not in primary_keys:
+                        bundled_dirs.append(bundled)
+                except Exception:
+                    if bundled not in primary_dirs:
+                        bundled_dirs.append(bundled)
+        all_dirs = primary_dirs + bundled_dirs
 
         if not all_dirs:
             return json.dumps(
@@ -957,56 +1005,78 @@ def skill_view(
         skill_dir = None
         skill_md = None
 
-        # Collision detection: collect ALL candidates across every dir using
-        # every lookup strategy (direct path, recursive by parent dir name,
-        # legacy flat <name>.md). If more than one matches, refuse and tell
-        # the caller — silent shadowing of a local skill by a same-named
-        # external skill is a real bug class (`/skills` shows one, agent
-        # loaded the other) so we surface it loudly instead of guessing.
-        from agent.skill_utils import iter_skill_index_files
+        def _collect_candidates(search_dirs: List[Path]) -> List[Tuple[Optional[Path], Path]]:
+            candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
+            seen_md: set = set()
 
-        candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
-        seen_md: set = set()
+            def _record(sd: Optional[Path], smd: Path) -> None:
+                try:
+                    key = smd.resolve()
+                except Exception:
+                    key = smd
+                if key in seen_md:
+                    return
+                seen_md.add(key)
+                candidates.append((sd, smd))
 
-        def _record(sd: Optional[Path], smd: Path) -> None:
-            try:
-                key = smd.resolve()
-            except Exception:
-                key = smd
-            if key in seen_md:
-                return
-            seen_md.add(key)
-            candidates.append((sd, smd))
+            # Prefer real skill directories/SKILL.md entries over legacy flat
+            # markdown files. Otherwise bundled support files like
+            # popular-web-designs/templates/spotify.md collide with the real
+            # spotify/SKILL.md skill.
+            for search_dir in search_dirs:
+                # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
+                # at the top of the dir).
+                direct_path = search_dir / name
+                if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
+                    _record(direct_path, direct_path / "SKILL.md")
+                elif direct_path.with_suffix(".md").exists():
+                    _record(None, direct_path.with_suffix(".md"))
 
-        for search_dir in all_dirs:
-            # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
-            # at the top of the dir).
-            direct_path = search_dir / name
-            if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
-                _record(direct_path, direct_path / "SKILL.md")
-            elif direct_path.with_suffix(".md").exists():
-                _record(None, direct_path.with_suffix(".md"))
+                # Strategy 1b: categorized form for plugin namespace fall-through
+                # (e.g., a "myplugin:explore" name with no plugin registered also
+                # tries the on-disk path "myplugin/explore").
+                if local_category_name:
+                    categorized_path = search_dir / local_category_name
+                    if categorized_path.is_dir() and (categorized_path / "SKILL.md").exists():
+                        _record(categorized_path, categorized_path / "SKILL.md")
+                    elif categorized_path.with_suffix(".md").exists():
+                        _record(None, categorized_path.with_suffix(".md"))
 
-            # Strategy 1b: categorized form for plugin namespace fall-through
-            # (e.g., a "myplugin:explore" name with no plugin registered also
-            # tries the on-disk path "myplugin/explore").
-            if local_category_name:
-                categorized_path = search_dir / local_category_name
-                if categorized_path.is_dir() and (categorized_path / "SKILL.md").exists():
-                    _record(categorized_path, categorized_path / "SKILL.md")
-                elif categorized_path.with_suffix(".md").exists():
-                    _record(None, categorized_path.with_suffix(".md"))
+                # Strategy 2: recursive SKILL.md by directory or frontmatter name
+                # (catches categorized skills whose directory differs from name).
+                for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
+                    if found_skill_md.parent.name == name:
+                        _record(found_skill_md.parent, found_skill_md)
+                        continue
+                    try:
+                        _frontmatter, _ = _parse_frontmatter(
+                            found_skill_md.read_text(encoding="utf-8")[:4000]
+                        )
+                    except Exception:
+                        continue
+                    if str(_frontmatter.get("name") or "") == name:
+                        _record(found_skill_md.parent, found_skill_md)
 
-            # Strategy 2: recursive by directory name (catches nested skills
-            # like "foundations/runtime/explore-codebase" called by bare name).
-            for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-                if found_skill_md.parent.name == name:
-                    _record(found_skill_md.parent, found_skill_md)
+            if candidates:
+                return candidates
 
             # Strategy 3: legacy flat <name>.md files anywhere under the dir.
-            for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md":
-                    _record(None, found_md)
+            # Only use this when no SKILL.md candidate exists in this search tier.
+            for search_dir in search_dirs:
+                for found_md in search_dir.rglob(f"{name}.md"):
+                    try:
+                        rel_parts = found_md.relative_to(search_dir).parts
+                    except ValueError:
+                        rel_parts = found_md.parts
+                    if any(part in _EXCLUDED_SKILL_DIRS for part in rel_parts):
+                        continue
+                    if found_md.name != "SKILL.md":
+                        _record(None, found_md)
+            return candidates
+
+        candidates = _collect_candidates(primary_dirs)
+        if not candidates and bundled_dirs:
+            candidates = _collect_candidates(bundled_dirs)
 
         if len(candidates) > 1:
             paths = [str(smd) for _, smd in candidates]
@@ -1019,7 +1089,7 @@ def skill_view(
                     "success": False,
                     "error": (
                         f"Ambiguous skill name '{name}': {len(candidates)} skills "
-                        "match across your local skills dir and external_dirs. "
+                        "match across your profile, external, or bundled skill roots. "
                         "Refusing to guess — load one explicitly by its categorized path."
                     ),
                     "matches": paths,

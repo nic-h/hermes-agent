@@ -551,6 +551,87 @@ class TestSkillView:
             skill["name"] for skill in list_result["skills"]
         ]
 
+    def test_bundled_skill_is_fallback_when_profile_copy_absent(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        profile_skills = home / "skills"
+        profile_skills.mkdir(parents=True)
+        bundled_skills = tmp_path / "bundled"
+        _make_skill(bundled_skills, "bundled-only", category="creative")
+
+        monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(bundled_skills))
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", profile_skills),
+            patch("tools.skills_tool.get_hermes_home", return_value=home),
+        ):
+            raw = skill_view("bundled-only")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["name"] == "bundled-only"
+        assert str(bundled_skills) in result["skill_dir"]
+
+    def test_bundled_fallback_matches_frontmatter_name_when_dir_differs(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        profile_skills = home / "skills"
+        profile_skills.mkdir(parents=True)
+        bundled_skills = tmp_path / "bundled"
+        _make_skill(bundled_skills, "creative-ideation", frontmatter_extra="name: ideation\n", category="creative")
+
+        monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(bundled_skills))
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", profile_skills),
+            patch("tools.skills_tool.get_hermes_home", return_value=home),
+        ):
+            raw = skill_view("ideation")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["name"] == "ideation"
+        assert str(bundled_skills) in result["skill_dir"]
+
+    def test_profile_skill_shadows_bundled_copy_without_ambiguity(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        profile_skills = home / "skills"
+        profile_skills.mkdir(parents=True)
+        bundled_skills = tmp_path / "bundled"
+        _make_skill(profile_skills, "humanizer", body="profile version")
+        _make_skill(bundled_skills, "humanizer", body="bundled version")
+
+        monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(bundled_skills))
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", profile_skills),
+            patch("tools.skills_tool.get_hermes_home", return_value=home),
+        ):
+            raw = skill_view("humanizer")
+            listed = json.loads(skills_list())
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "profile version" in result["content"]
+        assert "bundled version" not in result["content"]
+        assert [s["name"] for s in listed["skills"]].count("humanizer") == 1
+
+    def test_archive_flat_markdown_does_not_shadow_bundled_skill(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        profile_skills = home / "skills"
+        archive = profile_skills / ".archive" / "old" / "templates"
+        archive.mkdir(parents=True)
+        (archive / "spotify.md").write_text("archived flat markdown")
+        bundled_skills = tmp_path / "bundled"
+        _make_skill(bundled_skills, "spotify", body="bundled skill")
+
+        monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(bundled_skills))
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", profile_skills),
+            patch("tools.skills_tool.get_hermes_home", return_value=home),
+        ):
+            raw = skill_view("spotify")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "bundled skill" in result["content"]
+        assert "archived flat markdown" not in result["content"]
+
 
 class TestSkillViewSecureSetupOnLoad:
     def test_requests_missing_required_env_and_continues(self, tmp_path, monkeypatch):
