@@ -357,6 +357,80 @@ class TestAnthropicOAuthFlag:
         assert model == "claude-haiku-4-5-20251001"
         assert mock_build.call_args.args[0] == "sk-ant-oat01-pooled"
 
+    def test_secondary_anthropic_provider_uses_provider_base_url(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model": {"provider": "openai-codex", "default": "gpt-5.5"},
+                "providers": {"anthropic": {"base_url": "http://127.0.0.1:42069"}},
+            },
+        )
+        with (
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)),
+            patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant...local"),
+            patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()) as mock_build,
+        ):
+            from agent.auxiliary_client import _try_anthropic
+
+            client, model = _try_anthropic()
+
+        assert client is not None
+        assert model == "claude-haiku-4-5-20251001"
+        assert mock_build.call_args.args[0] == "sk-ant...local"
+        assert mock_build.call_args.args[1] == "http://127.0.0.1:42069"
+
+    def test_secondary_anthropic_provider_uses_provider_base_url_for_pool_default_url(self, monkeypatch):
+        class _Entry:
+            access_token = "sk-ant-oat01-pooled"
+            base_url = "https://api.anthropic.com"
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model": {"provider": "openai-codex", "default": "gpt-5.5"},
+                "providers": {"anthropic": {"base_url": "http://127.0.0.1:42069"}},
+            },
+        )
+        with (
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(True, _Entry())),
+            patch("agent.anthropic_adapter.resolve_anthropic_token", side_effect=AssertionError("legacy path should not run")),
+            patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()) as mock_build,
+        ):
+            from agent.auxiliary_client import _try_anthropic
+
+            client, model = _try_anthropic()
+
+        assert client is not None
+        assert model == "claude-haiku-4-5-20251001"
+        assert mock_build.call_args.args[0] == "sk-ant-oat01-pooled"
+        assert mock_build.call_args.args[1] == "http://127.0.0.1:42069"
+
+    def test_secondary_anthropic_provider_keeps_non_default_pool_base_url(self, monkeypatch):
+        class _Entry:
+            access_token = "sk-ant-oat01-pooled"
+            base_url = "https://pool-proxy.example.com/anthropic"
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model": {"provider": "openai-codex", "default": "gpt-5.5"},
+                "providers": {"anthropic": {"base_url": "http://127.0.0.1:42069"}},
+            },
+        )
+        with (
+            patch("agent.auxiliary_client._select_pool_entry", return_value=(True, _Entry())),
+            patch("agent.anthropic_adapter.resolve_anthropic_token", side_effect=AssertionError("legacy path should not run")),
+            patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()) as mock_build,
+        ):
+            from agent.auxiliary_client import _try_anthropic
+
+            client, model = _try_anthropic()
+
+        assert client is not None
+        assert model == "claude-haiku-4-5-20251001"
+        assert mock_build.call_args.args[0] == "sk-ant-oat01-pooled"
+        assert mock_build.call_args.args[1] == "https://pool-proxy.example.com/anthropic"
+
 
 class TestBuildCodexClient:
     def test_pool_without_selected_entry_falls_back_to_auth_store(self):

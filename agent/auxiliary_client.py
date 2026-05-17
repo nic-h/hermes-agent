@@ -2054,6 +2054,15 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
                 cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
                 if cfg_base_url:
                     base_url = cfg_base_url
+        # Also honor providers.anthropic.base_url so the fallback chain
+        # routes through a local Anthropic-compatible proxy when anthropic
+        # is the secondary provider (top-level model.provider differs).
+        if base_url == _ANTHROPIC_DEFAULT_BASE_URL:
+            providers_cfg = cfg.get("providers") or {}
+            anth_cfg = providers_cfg.get("anthropic") or {}
+            anth_base_url = str(anth_cfg.get("base_url") or "").strip().rstrip("/")
+            if anth_base_url:
+                base_url = anth_base_url
     except Exception:
         pass
 

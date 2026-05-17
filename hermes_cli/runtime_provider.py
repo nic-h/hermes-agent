@@ -332,6 +332,16 @@ def _resolve_runtime_from_pool_entry(
         cfg_base_url = ""
         if cfg_provider == "anthropic":
             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+        # Also honor providers.anthropic.base_url for setups where anthropic
+        # is a fallback/secondary provider (top-level model.provider differs),
+        # but do not override a non-default base URL stored on the credential.
+        if not cfg_base_url and (not base_url or base_url.rstrip("/") == "https://api.anthropic.com"):
+            try:
+                _providers_cfg = load_config().get("providers") or {}
+                _anth_cfg = _providers_cfg.get("anthropic") or {}
+                cfg_base_url = str(_anth_cfg.get("base_url") or "").strip().rstrip("/")
+            except Exception:
+                pass
         base_url = cfg_base_url or base_url or "https://api.anthropic.com"
     elif provider == "openrouter":
         base_url = base_url or OPENROUTER_BASE_URL
@@ -1069,6 +1079,13 @@ def _resolve_explicit_runtime(
         cfg_base_url = ""
         if cfg_provider == "anthropic":
             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+        if not cfg_base_url:
+            try:
+                _providers_cfg = load_config().get("providers") or {}
+                _anth_cfg = _providers_cfg.get("anthropic") or {}
+                cfg_base_url = str(_anth_cfg.get("base_url") or "").strip().rstrip("/")
+            except Exception:
+                pass
         base_url = explicit_base_url or cfg_base_url or "https://api.anthropic.com"
         api_key = explicit_api_key
         if not api_key:
