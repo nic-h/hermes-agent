@@ -1023,6 +1023,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                         explicit_api_key = os.getenv(key_env, "").strip() or None
                 runtime = resolve_runtime_provider(
                     requested=entry.get("provider"),
+                    target_model=entry.get("model"),
                     explicit_base_url=entry.get("base_url"),
                     explicit_api_key=explicit_api_key,
                 )
@@ -1035,7 +1036,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "api_key": runtime.get("api_key"),
                     "base_url": runtime.get("base_url"),
                     "provider": runtime.get("provider"),
-                    "api_mode": runtime.get("api_mode"),
+                    "api_mode": entry.get("api_mode") or runtime.get("api_mode"),
                     "command": runtime.get("command"),
                     "args": list(runtime.get("args") or []),
                     "credential_pool": runtime.get("credential_pool"),
