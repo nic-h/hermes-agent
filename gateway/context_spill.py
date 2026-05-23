@@ -161,7 +161,13 @@ def load_context_spill_config(
     allow_unsafe = bool(allow_unsafe_paths or raw_cfg.get("allow_unsafe_paths") or env_unsafe)
 
     wiki_dir = _resolve_path(raw_cfg.get("wiki_dir"), "~/wiki/outputs/gateway-context-spills")
-    raw_state_dir = _resolve_path(raw_cfg.get("raw_state_dir"), str(hermes_home / "state" / "context-spills"))
+    raw_state_value = raw_cfg.get("raw_state_dir")
+    # DEFAULT_CONFIG historically stores ~/.hermes explicitly. In profile or
+    # custom-HERMES_HOME runs, treat that bundled default as "under this active
+    # Hermes home" instead of validating it against the wrong home directory.
+    if raw_state_value in (None, "~/.hermes/state/context-spills"):
+        raw_state_value = str(hermes_home / "state" / "context-spills")
+    raw_state_dir = _resolve_path(raw_state_value, str(hermes_home / "state" / "context-spills"))
     _validate_spill_paths(wiki_dir, raw_state_dir, hermes_home, allow_unsafe=allow_unsafe)
 
     return ContextSpillConfig(
@@ -590,9 +596,13 @@ def request_pressure_from_api_kwargs(api_kwargs: dict[str, Any], *, context_leng
     """Estimate final provider request pressure from built API kwargs."""
     messages = api_kwargs.get("messages") if isinstance(api_kwargs, dict) else []
     if not isinstance(messages, list):
-        messages = api_kwargs.get("input") if isinstance(api_kwargs, dict) else []
-    if not isinstance(messages, list):
-        messages = []
+        request_input = api_kwargs.get("input") if isinstance(api_kwargs, dict) else []
+        if isinstance(request_input, list):
+            messages = request_input
+        elif request_input is None:
+            messages = []
+        else:
+            messages = [{"role": "user", "content": request_input}]
     tools = api_kwargs.get("tools") if isinstance(api_kwargs, dict) else None
     system_prompt = ""
     if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":

@@ -207,6 +207,15 @@ def test_request_pressure_guard_blocks_large_payload():
     assert pressure["too_large"] is True
 
 
+def test_request_pressure_guard_counts_scalar_input_payload():
+    pressure = request_pressure_from_api_kwargs(
+        {"model": "responses", "input": "x" * 240_000, "tools": []},
+        context_length=64_000,
+    )
+    assert pressure["too_large"] is True
+    assert pressure["approx_tokens"] > 0
+
+
 def test_request_pressure_guard_uses_large_model_context_not_180k_cap():
     # Regression for Codex-routed GPT-5.5: ~183k estimated tokens is below
     # 90% of a 272k context window, so the final pre-API guard must not call it
@@ -323,6 +332,16 @@ def test_load_context_spill_config_known_defaults_with_temp_paths(tmp_path):
     assert cfg.hard_message_limit == 180
 
 
+def test_load_context_spill_config_rehomes_bundled_raw_state_default(tmp_path):
+    hermes_home = tmp_path / "profile-home"
+    cfg = load_context_spill_config(
+        {"gateway_context_spill": {"raw_state_dir": "~/.hermes/state/context-spills"}},
+        hermes_home,
+        allow_unsafe_paths=True,
+    )
+    assert cfg.raw_state_dir == hermes_home / "state" / "context-spills"
+
+
 @pytest.mark.asyncio
 async def test_pre_api_guard_spill_preserves_ask_and_quarantines_old_session(monkeypatch, tmp_path):
     from gateway.run import GatewayRunner
@@ -343,7 +362,8 @@ async def test_pre_api_guard_spill_preserves_ask_and_quarantines_old_session(mon
     runner._session_model_overrides = {}
     runner._session_reasoning_overrides = {}
     runner._pending_model_notes = {}
-    runner._agent_cache_lock = None
+    runner._agent_cache = __import__("collections").OrderedDict()
+    runner._agent_cache_lock = __import__("threading").Lock()
 
     raw_dir = tmp_path / "state" / "context-spills" / "custom-raw"
     monkeypatch.setattr(
@@ -381,6 +401,67 @@ async def test_pre_api_guard_spill_preserves_ask_and_quarantines_old_session(mon
     assert new_entry.session_id != old_sid
     assert store.is_session_quarantined(old_sid) is True
     assert store.switch_session(entry.session_key, old_sid) is None
+
+
+@pytest.mark.asyncio
+async def test_pre_api_guard_spill_respects_reset_live_session_false(monkeypatch, tmp_path):
+    from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
+
+    source = _source()
+    gw_cfg = GatewayConfig(platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="x")})
+    gw_cfg.sessions_dir = tmp_path / "sessions"
+    store = SessionStore(gw_cfg.sessions_dir, gw_cfg)
+    store._db = None
+    entry = store.get_or_create_session(source)
+    old_sid = entry.session_id
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = gw_cfg
+    runner.session_store = store
+    runner.adapters = {}
+    runner._session_model_overrides = {}
+    runner._session_reasoning_overrides = {}
+    runner._pending_model_notes = {}
+    runner._agent_cache = __import__("collections").OrderedDict()
+    runner._agent_cache_lock = __import__("threading").Lock()
+
+    raw_dir = tmp_path / "state" / "context-spills" / "custom-raw"
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_config",
+        lambda: {
+            "gateway_context_spill": {
+                "wiki_dir": str(tmp_path / "wiki" / "outputs" / "gateway-context-spills"),
+                "raw_state_dir": str(raw_dir),
+                "allow_unsafe_paths": True,
+                "reset_live_session": False,
+            }
+        },
+    )
+
+    spill = await runner._spill_gateway_context_after_request_guard(
+        history=[{"role": "user", "content": "old transcript"}],
+        message_text="keep this lane open",
+        source=source,
+        session_entry=entry,
+        session_key=entry.session_key,
+        agent_result={
+            "request_size_guard": {
+                "approx_tokens": 190_000,
+                "request_bytes": 2_000_000,
+                "threshold_tokens": 180_000,
+            }
+        },
+        context_prompt="system prompt",
+        channel_prompt="",
+    )
+
+    assert spill is not None
+    result, new_entry = spill
+    assert result.raw_path and result.raw_path.exists()
+    assert new_entry.session_id == old_sid
+    assert store.is_session_quarantined(old_sid) is False
 
 
 @pytest.mark.asyncio

@@ -359,6 +359,8 @@ def run_conversation(
     # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
     # They are initialized in __init__ and must persist across run_conversation
     # calls so that nudge logic accumulates correctly in CLI mode.
+    if not hasattr(agent, "_configured_max_iterations"):
+        agent._configured_max_iterations = int(getattr(agent, "max_iterations", 90) or 90)
     turn_max_iterations = agent._resolve_turn_max_iterations(user_message, conversation_history) if hasattr(agent, "_resolve_turn_max_iterations") else agent.max_iterations
     agent.max_iterations = turn_max_iterations
     agent._last_resolved_turn_max_iterations = turn_max_iterations

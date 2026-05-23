@@ -82,12 +82,12 @@ class TestMaxTurnsResolution:
         assert cli.max_turns == 16
 
     def test_env_var_max_turns(self):
-        """Env var is used when config file doesn't set max_turns."""
+        """Stale legacy env var does not shadow the known CLI default."""
         cli_obj = _make_cli(
             env_overrides={"HERMES_MAX_ITERATIONS": "42"},
             config_overrides={"agent": {}},
         )
-        assert cli_obj.max_turns == 42
+        assert cli_obj.max_turns == 16
 
     def test_invalid_env_var_max_turns_falls_back_to_default(self):
         """Invalid env values should not crash CLI init."""

@@ -152,15 +152,15 @@ def test_config_timezone_wins_over_stale_env(hermes_home: Path) -> None:
     assert env.get("HERMES_TIMEZONE") == "America/Los_Angeles"
 
 
-def test_env_value_survives_when_config_omits_key(hermes_home: Path) -> None:
-    """If config.yaml doesn't set max_turns, .env value must still pass through.
+def test_gateway_default_wins_when_config_omits_key(hermes_home: Path) -> None:
+    """Partial config must still stamp the resolved gateway default.
 
-    The bridge only overwrites when the config key is present — an absent
-    config key should NOT clobber the .env value.
+    A stale .env HERMES_MAX_ITERATIONS must not shadow task-shaped defaults
+    just because config.yaml omits the legacy max_turns key.
     """
     _write_config(hermes_home, agent_cfg={})  # no max_turns
     _write_env(hermes_home, {"HERMES_MAX_ITERATIONS": "123"})
 
     env = _run_gateway_import(hermes_home, initial_env={})
 
-    assert env.get("HERMES_MAX_ITERATIONS") == "123"
+    assert env.get("HERMES_MAX_ITERATIONS") == "32"

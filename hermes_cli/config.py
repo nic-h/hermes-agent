@@ -99,10 +99,16 @@ def resolve_agent_max_turns(
             value = _positive_int(raw)
             if value is not None and value != 90:
                 return value
-        env_map = env if env is not None else os.environ
-        value = _positive_int(env_map.get("HERMES_MAX_ITERATIONS") if env_map else None)
-        if value is not None and value != 90:
-            return value
+
+        # HERMES_MAX_ITERATIONS is a legacy env fallback, not a surface-budget
+        # authority. Do not let a stale .env value shadow known task-shaped
+        # defaults (cli=16, gateway=32, cron=90, etc.) when config is missing
+        # or partial; that is the exact failure mode this resolver prevents.
+        if mode_key not in defaults:
+            env_map = env if env is not None else os.environ
+            value = _positive_int(env_map.get("HERMES_MAX_ITERATIONS") if env_map else None)
+            if value is not None and value != 90:
+                return value
 
     return defaults.get(mode_key) or _positive_int(agent_cfg.get("max_turns") if isinstance(agent_cfg, dict) else None) or 90
 

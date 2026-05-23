@@ -710,24 +710,18 @@ def _reload_runtime_env_preserving_config_authority() -> None:
     .env can replace the startup bridge on later turns.
     """
     cfg = _load_gateway_config()
-    config_owns_budget = _has_configured_gateway_iteration_budget(cfg, "gateway")
-    resolved_budget = (
-        _resolve_gateway_max_iterations_from_config(cfg, "gateway")
-        if config_owns_budget
-        else None
-    )
+    resolved_budget = _resolve_gateway_max_iterations_from_config(cfg, "gateway")
 
     load_hermes_dotenv(
         hermes_home=_hermes_home,
         project_env=Path(__file__).resolve().parents[1] / '.env',
     )
 
-    # Reload .env for credentials, then restore config authority for the legacy
-    # env var consumed by older gateway/tool paths. This is the resolver output
-    # for the gateway surface (turn_budgets.gateway when present, otherwise a
-    # non-default explicit agent.max_turns), not a blind max_turns mirror.
-    if resolved_budget is not None:
-        os.environ["HERMES_MAX_ITERATIONS"] = str(resolved_budget)
+    # Reload .env for credentials, then restore config/default authority for
+    # the legacy env var consumed by older gateway/tool paths. Even if config
+    # is partial or omits agent.turn_budgets, the task-shaped gateway default
+    # must beat a stale .env HERMES_MAX_ITERATIONS.
+    os.environ["HERMES_MAX_ITERATIONS"] = str(resolved_budget)
 
 
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
@@ -837,14 +831,13 @@ if _config_path.exists():
                     os.environ[_env_map["base_url"]] = _base_url
                 if _api_key:
                     os.environ[_env_map["api_key"]] = _api_key
-        # config.yaml remains authoritative for gateway runtime settings.
+        # config.yaml/defaults remain authoritative for gateway runtime settings.
         # Bridge the resolved gateway budget (turn_budgets.gateway when set,
-        # otherwise an explicit non-default legacy max_turns) for legacy env
-        # consumers; do not blindly mirror the global max_turns.
-        if _has_configured_gateway_iteration_budget(_cfg, "gateway"):
-            os.environ["HERMES_MAX_ITERATIONS"] = str(
-                _resolve_gateway_max_iterations_from_config(_cfg, "gateway")
-            )
+        # otherwise explicit legacy max_turns or the gateway default) for legacy
+        # env consumers; never let stale .env HERMES_MAX_ITERATIONS win.
+        os.environ["HERMES_MAX_ITERATIONS"] = str(
+            _resolve_gateway_max_iterations_from_config(_cfg, "gateway")
+        )
         _agent_cfg = _cfg.get("agent", {})
         if _agent_cfg and isinstance(_agent_cfg, dict):
             if "gateway_timeout" in _agent_cfg:
@@ -8064,21 +8057,24 @@ class GatewayRunner:
             decision=decision,
             config=spill_config,
         )
-        new_entry = self.session_store.spill_and_reset_session(
-            session_key,
-            old_session_id=session_entry.session_id,
-            spill_id=result.spill_id,
-            wiki_path=str(result.wiki_path) if result.wiki_path else None,
-            raw_path=str(result.raw_path) if result.raw_path else None,
-            reason=decision.reason,
-        )
-        if new_entry is None:
-            raise ContextSpillWriteError("session reset failed after spill write")
-        self._evict_cached_agent(session_key)
-        self._session_model_overrides.pop(session_key, None)
-        self._set_session_reasoning_override(session_key, None)
-        if hasattr(self, "_pending_model_notes"):
-            self._pending_model_notes.pop(session_key, None)
+        if spill_config.reset_live_session:
+            new_entry = self.session_store.spill_and_reset_session(
+                session_key,
+                old_session_id=session_entry.session_id,
+                spill_id=result.spill_id,
+                wiki_path=str(result.wiki_path) if result.wiki_path else None,
+                raw_path=str(result.raw_path) if result.raw_path else None,
+                reason=decision.reason,
+            )
+            if new_entry is None:
+                raise ContextSpillWriteError("session reset failed after spill write")
+            self._evict_cached_agent(session_key)
+            self._session_model_overrides.pop(session_key, None)
+            self._set_session_reasoning_override(session_key, None)
+            if hasattr(self, "_pending_model_notes"):
+                self._pending_model_notes.pop(session_key, None)
+        else:
+            new_entry = session_entry
         logger.warning(
             "Gateway context spill enforced: old_session=%s new_session=%s spill=%s stage=%s reason=%s",
             session_entry.session_id,
@@ -8186,21 +8182,24 @@ class GatewayRunner:
             decision=decision,
             config=spill_config,
         )
-        new_entry = self.session_store.spill_and_reset_session(
-            session_key,
-            old_session_id=session_entry.session_id,
-            spill_id=result.spill_id,
-            wiki_path=str(result.wiki_path) if result.wiki_path else None,
-            raw_path=str(result.raw_path) if result.raw_path else None,
-            reason=decision.reason,
-        )
-        if new_entry is None:
-            raise ContextSpillWriteError("session reset failed after pre-api guard spill write")
-        self._evict_cached_agent(session_key)
-        self._session_model_overrides.pop(session_key, None)
-        self._set_session_reasoning_override(session_key, None)
-        if hasattr(self, "_pending_model_notes"):
-            self._pending_model_notes.pop(session_key, None)
+        if spill_config.reset_live_session:
+            new_entry = self.session_store.spill_and_reset_session(
+                session_key,
+                old_session_id=session_entry.session_id,
+                spill_id=result.spill_id,
+                wiki_path=str(result.wiki_path) if result.wiki_path else None,
+                raw_path=str(result.raw_path) if result.raw_path else None,
+                reason=decision.reason,
+            )
+            if new_entry is None:
+                raise ContextSpillWriteError("session reset failed after pre-api guard spill write")
+            self._evict_cached_agent(session_key)
+            self._session_model_overrides.pop(session_key, None)
+            self._set_session_reasoning_override(session_key, None)
+            if hasattr(self, "_pending_model_notes"):
+                self._pending_model_notes.pop(session_key, None)
+        else:
+            new_entry = session_entry
         logger.warning(
             "Gateway context spill enforced after pre-api guard: old_session=%s new_session=%s spill=%s reason=%s",
             session_entry.session_id,

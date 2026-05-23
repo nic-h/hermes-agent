@@ -37,7 +37,7 @@ def test_reload_runtime_env_preserves_config_max_turns(tmp_path: Path, monkeypat
     assert os.environ["HERMES_MAX_ITERATIONS"] == "9000"
 
 
-def test_reload_runtime_env_keeps_env_max_iterations_when_config_omits_key(
+def test_reload_runtime_env_reasserts_gateway_default_when_config_omits_key(
     tmp_path: Path, monkeypatch
 ) -> None:
     hermes_home = tmp_path / ".hermes"
@@ -50,4 +50,4 @@ def test_reload_runtime_env_keeps_env_max_iterations_when_config_omits_key(
 
     gateway_run._reload_runtime_env_preserving_config_authority()
 
-    assert os.environ["HERMES_MAX_ITERATIONS"] == "123"
+    assert os.environ["HERMES_MAX_ITERATIONS"] == "32"
