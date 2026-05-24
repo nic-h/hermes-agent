@@ -1743,6 +1743,13 @@ def create_task(
                         "skills": list(skills_list) if skills_list else None,
                     },
                 )
+                if task_status == 'blocked':
+                    _append_event(
+                        conn,
+                        task_id,
+                        'blocked',
+                        {'reason': 'created with initial_status=blocked'},
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

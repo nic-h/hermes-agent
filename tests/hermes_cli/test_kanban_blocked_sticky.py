@@ -99,6 +99,28 @@ def test_worker_block_on_child_with_done_parents_is_still_sticky(kanban_home: Pa
         assert kb.get_task(conn, child).status == "blocked"
 
 
+def test_initial_status_blocked_task_with_done_parent_stays_sticky(kanban_home: Path) -> None:
+    """Tasks parked with initial_status=blocked are deliberate backlog/gate
+    cards, not dependency-blocked cards. They must not auto-promote just
+    because their parent later completes."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(
+            conn,
+            title="speculative lane",
+            parents=[parent],
+            initial_status="blocked",
+        )
+        kb.complete_task(conn, parent, result="parent ok")
+
+        for _ in range(3):
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, child).status == "blocked"
+
+        assert kb.unblock_task(conn, child)
+        assert kb.get_task(conn, child).status == "ready"
+
+
 # ---------------------------------------------------------------------------
 # Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
 # ---------------------------------------------------------------------------
