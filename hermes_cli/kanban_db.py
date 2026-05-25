@@ -2321,8 +2321,8 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    """Return True when ``task_id`` must stay blocked until an explicit
+    operator action.
 
     A ``blocked`` status can come from two very different sources:
 
@@ -2334,28 +2334,27 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
       repeated crashes / spawn failures / timeouts.  This emits
-      ``"gave_up"``, *not* ``"blocked"``, and is meant to recover
-      automatically once the underlying conditions change (e.g. parents
-      finish, transient infra error clears).
+      ``"gave_up"``, *not* ``"blocked"``.  A circuit breaker is also a
+      deliberate stop signal: automatically promoting it on the same
+      dispatcher tick just respawns the exact worker that failed and
+      creates an infinite crash loop.
 
-    The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
+    The cheapest signal is the most recent block-state event for the
+    task.  If the most recent one is ``"blocked"`` or ``"gave_up"`` (and
     no ``"unblocked"`` event has fired since), the task is sticky and
     ``recompute_ready`` must *not* auto-promote it.
 
-    Returns ``False`` when there is no such event at all (e.g. the task
-    was set to ``status='blocked'`` by the circuit breaker or by direct
-    DB manipulation) — preserves the pre-#28712 auto-recover semantics
-    for that path.
+    Returns ``False`` when there is no such event at all (e.g. a task was
+    directly inserted/updated to ``status='blocked'`` without an event),
+    preserving auto-promotion for legacy dependency-only blockers.
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'gave_up', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in ("blocked", "gave_up")
 
 
 def recompute_ready(conn: sqlite3.Connection) -> int:
@@ -2364,14 +2363,14 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
 
-    ``blocked`` tasks are also considered for promotion (so a task
-    blocked purely by a parent dependency unblocks itself when the
-    parent completes), *except* when the most recent block event was a
-    worker-initiated ``kanban_block`` — those stay blocked until an
-    explicit ``kanban_unblock`` (#28712).  Without that guard, a
-    ``review-required`` handoff would auto-respawn, the fresh worker
-    would find nothing to do, exit cleanly, get recorded as a protocol
-    violation, and the cycle would repeat indefinitely.
+    ``blocked`` tasks are also considered for promotion (so a legacy
+    task blocked purely by a parent dependency unblocks itself when the
+    parent completes), *except* when the latest block-state event is a
+    worker/operator ``blocked`` event or a circuit-breaker ``gave_up``
+    event — those stay blocked until an explicit ``kanban_unblock``
+    (#28712).  Without that guard, a ``review-required`` handoff or
+    failed worker auto-respawns, exits/fails again, and repeats
+    indefinitely.
     """
     promoted = 0
     with write_txn(conn):
@@ -2395,8 +2394,9 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
                 # Blocked tasks also get their failure counters reset —
-                # this is effectively an auto-unblock (circuit-breaker
-                # recovery; worker-initiated blocks are skipped above).
+                # this is effectively an auto-unblock for legacy
+                # dependency-only blockers.  Worker/operator blocks and
+                # circuit-breaker gave_up blocks are skipped above.
                 if cur_status == "blocked":
                     conn.execute(
                         "UPDATE tasks SET status = 'ready', "

@@ -109,6 +109,38 @@ def test_spawn_failure_auto_blocks_after_limit(kanban_home, all_assignees_spawna
         conn.close()
 
 
+def test_gave_up_block_is_not_repromoted_by_recompute_ready(kanban_home, all_assignees_spawnable):
+    """Circuit-breaker blocks must stay blocked until explicit unblock.
+
+    Regression for the live AIVS daemon loop: ``dispatch_once`` records
+    ``gave_up`` then immediately calls ``recompute_ready``. If gave_up is not
+    sticky, a parent-free task flips blocked -> ready in the same tick and
+    respawns forever.
+    """
+    def _bad_spawn(task, ws):
+        raise RuntimeError("deterministic startup failure")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        res = kb.dispatch_once(conn, spawn_fn=_bad_spawn, failure_limit=1)
+        assert tid in res.auto_blocked
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 1
+
+        promoted = kb.recompute_ready(conn)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert promoted == 0
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 1
+    finally:
+        conn.close()
+
+
+
 def test_successful_spawn_does_not_reset_failure_counter(kanban_home, all_assignees_spawnable):
     """Under unified consecutive-failure counting, a successful spawn
     does NOT reset the counter — past failures stay on the books until
