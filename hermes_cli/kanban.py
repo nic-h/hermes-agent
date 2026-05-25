@@ -864,15 +864,16 @@ def kanban_command(args: argparse.Namespace) -> int:
         os.environ["HERMES_KANBAN_BOARD"] = normed
         restore_board_env = True
 
-    # Auto-initialize the DB before dispatching any subcommand. init_db
+    # Auto-initialize the DB before dispatching normal subcommands. init_db
     # is idempotent, so running it every invocation is cheap (one
     # SELECT against sqlite_master when tables already exist) and
     # prevents "no such table: tasks" on first use from a fresh
-    # HERMES_HOME. Previously only `init` and `daemon` triggered
-    # schema creation; `create` / `list` / every other command would
-    # error out on a fresh install.
+    # HERMES_HOME. Dispatch is the exception: it owns the board dispatch
+    # lock itself and must not force schema/migration work before it has
+    # proven no gateway/daemon tick is active.
     try:
-        kb.init_db()
+        if action != "dispatch":
+            kb.init_db()
     except Exception as exc:
         print(f"kanban: could not initialize database: {exc}", file=sys.stderr)
         _restore_board_env()
@@ -2002,13 +2003,24 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
-        res = kb.dispatch_once(
-            conn,
-            dry_run=args.dry_run,
-            max_spawn=args.max,
-            failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
-        )
+    try:
+        with kb.board_dispatch_lock():
+            kb.assert_board_db_healthy(force=True)
+            with kb.connect() as conn:
+                res = kb.dispatch_once(
+                    conn,
+                    dry_run=args.dry_run,
+                    max_spawn=args.max,
+                    failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+                )
+    except kb.KanbanDispatchLockBusy as exc:
+        print(f"dispatcher already active: {exc.lock_path}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        if kb.is_corrupt_db_error(exc):
+            print(f"kanban: refusing to dispatch corrupt database: {exc}", file=sys.stderr)
+            return 1
+        raise
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,

@@ -3038,6 +3038,43 @@ def test_connect_refuses_corrupt_existing_file(tmp_path):
         kb.connect(db_path=db_path)
 
 
+def test_corrupt_error_classifier_catches_guard_and_sqlite_messages(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    err = kb.KanbanDbCorruptError(db_path, None, "integrity_check returned 'bad'")
+    assert kb.is_corrupt_db_error(err)
+    assert kb.is_corrupt_db_error(sqlite3.DatabaseError("database disk image is malformed"))
+    assert kb.is_corrupt_db_error(sqlite3.DatabaseError("disk I/O error"))
+    assert kb.is_corrupt_db_error(sqlite3.DatabaseError("file is not a database"))
+    assert not kb.is_corrupt_db_error(sqlite3.OperationalError("database is locked"))
+
+
+def test_dispatch_lock_is_exclusive(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+
+    with kb.board_dispatch_lock(db_path=db_path):
+        with pytest.raises(kb.KanbanDispatchLockBusy):
+            with kb.board_dispatch_lock(db_path=db_path):
+                pass
+
+
+def test_forced_health_check_bypasses_process_cache(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    # Prove a normal connect marked the path healthy in this process.
+    with kb.connect(db_path=db_path):
+        pass
+    assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
+
+    original = _write_corrupt_db(db_path)
+
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+        kb.assert_board_db_healthy(db_path=db_path, force=True)
+
+    assert excinfo.value.backup_path is not None
+    assert excinfo.value.backup_path.read_bytes() == original
+
+
 def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     """A transient lock during the probe must not produce a .corrupt backup
     and must not be reported as :class:`KanbanDbCorruptError`. Raw sqlite

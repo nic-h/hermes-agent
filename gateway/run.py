@@ -5252,12 +5252,31 @@ class GatewayRunner:
             return (resolved, stat.st_mtime_ns, stat.st_size)
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
-            if not isinstance(exc, sqlite3.DatabaseError):
-                return False
-            msg = str(exc).lower()
-            return (
-                "file is not a database" in msg
-                or "database disk image is malformed" in msg
+            return _kb.is_corrupt_db_error(exc)
+
+        def _board_disabled_due_to_corruption(slug: str) -> bool:
+            fingerprint = _board_db_fingerprint(slug)
+            disabled_fingerprint = disabled_corrupt_boards.get(slug)
+            if disabled_fingerprint == fingerprint:
+                return True
+            if disabled_fingerprint is not None:
+                logger.info(
+                    "kanban dispatcher: board %s database changed; retrying dispatch",
+                    slug,
+                )
+                disabled_corrupt_boards.pop(slug, None)
+            return False
+
+        def _disable_corrupt_board(slug: str, fingerprint: tuple[str, int | None, int | None]) -> None:
+            disabled_corrupt_boards[slug] = fingerprint
+            logger.error(
+                "kanban dispatcher: board %s database %s failed SQLite "
+                "health checks; disabling dispatch for this board "
+                "until the file changes or the gateway restarts. Move "
+                "or restore the file, then run `hermes kanban init` if "
+                "you need a fresh board.",
+                slug,
+                fingerprint[0],
             )
 
         def _tick_once_for_board(slug: str) -> "Optional[object]":
@@ -5271,43 +5290,35 @@ class GatewayRunner:
             """
             conn = None
             fingerprint = _board_db_fingerprint(slug)
-            disabled_fingerprint = disabled_corrupt_boards.get(slug)
-            if disabled_fingerprint == fingerprint:
+            if _board_disabled_due_to_corruption(slug):
                 return None
-            if disabled_fingerprint is not None:
-                logger.info(
-                    "kanban dispatcher: board %s database changed; retrying dispatch",
+            try:
+                with _kb.board_dispatch_lock(board=slug):
+                    _kb.assert_board_db_healthy(board=slug, force=True)
+                    conn = _kb.connect(board=slug)
+                    # `connect()` runs the schema + idempotent migration on
+                    # first open per process; the previous explicit
+                    # `init_db()` call here busted the per-process cache and
+                    # re-ran the migration on a second connection, racing
+                    # the first. See the matching comment in
+                    # `_kanban_notifier_watcher` and issue #21378.
+                    return _kb.dispatch_once(
+                        conn,
+                        board=slug,
+                        max_spawn=max_spawn,
+                        max_in_progress=max_in_progress,
+                        failure_limit=failure_limit,
+                        stale_timeout_seconds=stale_timeout_seconds,
+                    )
+            except _kb.KanbanDispatchLockBusy:
+                logger.debug(
+                    "kanban dispatcher: board %s skipped; another dispatcher owns the lock",
                     slug,
                 )
-                disabled_corrupt_boards.pop(slug, None)
-            try:
-                conn = _kb.connect(board=slug)
-                # `connect()` runs the schema + idempotent migration on
-                # first open per process; the previous explicit
-                # `init_db()` call here busted the per-process cache and
-                # re-ran the migration on a second connection, racing
-                # the first. See the matching comment in
-                # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
-                    conn,
-                    board=slug,
-                    max_spawn=max_spawn,
-                    max_in_progress=max_in_progress,
-                    failure_limit=failure_limit,
-                    stale_timeout_seconds=stale_timeout_seconds,
-                )
-            except sqlite3.DatabaseError as exc:
+                return None
+            except (sqlite3.DatabaseError, _kb.KanbanDbCorruptError) as exc:
                 if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = fingerprint
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; disabling dispatch for this board "
-                        "until the file changes or the gateway restarts. Move "
-                        "or restore the file, then run `hermes kanban init` if "
-                        "you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
+                    _disable_corrupt_board(slug, fingerprint)
                     return None
                 logger.exception("kanban dispatcher: tick failed on board %s", slug)
                 return None
@@ -5356,6 +5367,8 @@ class GatewayRunner:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if _board_disabled_due_to_corruption(slug):
+                    continue
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
@@ -5411,6 +5424,19 @@ class GatewayRunner:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 if attempted >= auto_decompose_per_tick:
                     break
+                if _board_disabled_due_to_corruption(slug):
+                    continue
+                try:
+                    _kb.assert_board_db_healthy(board=slug, force=True)
+                except Exception as exc:
+                    if _is_corrupt_board_db_error(exc):
+                        _disable_corrupt_board(slug, _board_db_fingerprint(slug))
+                    else:
+                        logger.debug(
+                            "kanban auto-decompose: health check failed on board %s (%s)",
+                            slug, exc,
+                        )
+                    continue
                 # Pin this board for the duration of the call — same
                 # pattern as the dashboard specify endpoint. The
                 # decomposer module connects with no board kwarg and
@@ -5421,11 +5447,15 @@ class GatewayRunner:
                     try:
                         triage_ids = _decomp.list_triage_ids()
                     except Exception as exc:
-                        logger.debug(
-                            "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
-                            slug, exc,
-                        )
-                        triage_ids = []
+                        if _is_corrupt_board_db_error(exc):
+                            _disable_corrupt_board(slug, _board_db_fingerprint(slug))
+                            triage_ids = []
+                        else:
+                            logger.debug(
+                                "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
+                                slug, exc,
+                            )
+                            triage_ids = []
                     for tid in triage_ids:
                         if attempted >= auto_decompose_per_tick:
                             break
@@ -5434,7 +5464,10 @@ class GatewayRunner:
                             outcome = _decomp.decompose_task(
                                 tid, author="auto-decomposer",
                             )
-                        except Exception:
+                        except Exception as exc:
+                            if _is_corrupt_board_db_error(exc):
+                                _disable_corrupt_board(slug, _board_db_fingerprint(slug))
+                                break
                             logger.exception(
                                 "kanban auto-decompose: decompose_task crashed on %s",
                                 tid,

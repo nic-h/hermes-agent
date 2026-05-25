@@ -1026,6 +1026,105 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+class KanbanDispatchLockBusy(RuntimeError):
+    """Raised when another dispatcher already owns a board tick lock."""
+
+    def __init__(self, lock_path: Path):
+        self.lock_path = lock_path
+        super().__init__(f"another kanban dispatcher is active for this board ({lock_path})")
+
+
+_CORRUPT_DB_ERROR_MARKERS = (
+    "file is not a database",
+    "database disk image is malformed",
+    "disk i/o error",
+    "invalid sqlite header",
+    "malformed database schema",
+)
+
+
+def is_corrupt_db_error(exc: BaseException) -> bool:
+    """Return True for SQLite failures that must stop dispatch immediately.
+
+    Lock/busy/timeout errors are deliberately excluded. Those are transient
+    operational failures; corruption/disk-I/O errors mean the board DB must
+    be repaired or restored before any daemon continues reclaiming/spawning
+    work.
+    """
+    if isinstance(exc, KanbanDbCorruptError):
+        return True
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _CORRUPT_DB_ERROR_MARKERS)
+
+
+def dispatch_lock_path(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> Path:
+    """Return the board-scoped dispatcher singleton lock path."""
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    resolved = path.expanduser().resolve()
+    return resolved.parent / f".{resolved.name}.dispatch.lock"
+
+
+@contextlib.contextmanager
+def board_dispatch_lock(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+):
+    """Process-level singleton guard for dispatch ticks on one board.
+
+    SQLite CAS prevents duplicate task claims, but it does not prevent two
+    dispatchers from amplifying stale-reclaim/retry loops against the same
+    board. This lock makes gateway dispatch, manual `dispatch`, and forced
+    legacy daemons mutually exclusive per board.
+    """
+    lock_path = dispatch_lock_path(db_path=db_path, board=board)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    locked = False
+    try:
+        handle.seek(0)
+        if _IS_WINDOWS:
+            import msvcrt  # type: ignore[import-not-found]
+
+            try:
+                getattr(msvcrt, "locking")(handle.fileno(), getattr(msvcrt, "LK_NBLCK"), 1)
+            except OSError as exc:
+                raise KanbanDispatchLockBusy(lock_path) from exc
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise KanbanDispatchLockBusy(lock_path) from exc
+        locked = True
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps({"pid": os.getpid(), "created_at": int(time.time())}) + "\n")
+        handle.flush()
+        yield lock_path
+    finally:
+        try:
+            if locked:
+                if _IS_WINDOWS:
+                    import msvcrt  # type: ignore[import-not-found]
+
+                    handle.seek(0)
+                    getattr(msvcrt, "locking")(handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def _backup_corrupt_db(path: Path) -> Optional[Path]:
     """Copy a corrupt DB (and its WAL/SHM sidecars) to a timestamped backup.
 
@@ -1074,7 +1173,7 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     return candidate
 
 
-def _guard_existing_db_is_healthy(path: Path) -> None:
+def _guard_existing_db_is_healthy(path: Path, *, force: bool = False) -> None:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
     Opens the probe in read/write mode so SQLite can recover or
@@ -1110,7 +1209,7 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
             return
     except OSError:
         return
-    if str(resolved) in _INITIALIZED_PATHS:
+    if not force and str(resolved) in _INITIALIZED_PATHS:
         return
     reason: Optional[str] = None
     try:
@@ -1130,6 +1229,32 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         return
     backup = _backup_corrupt_db(resolved)
     raise KanbanDbCorruptError(resolved, backup, reason)
+
+
+def assert_board_db_healthy(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+    force: bool = True,
+) -> None:
+    """Fail closed when a board DB has become corrupt.
+
+    Dispatcher loops call this with ``force=True`` so a long-lived daemon does
+    not keep trusting a path cached healthy at process startup. Transient lock
+    errors still propagate as normal SQLite operational failures, not corrupt
+    backups.
+    """
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    _validate_sqlite_header(path)
+    _guard_existing_db_is_healthy(path, force=force)
+
+
+def _sqlite_synchronous_mode() -> str:
+    """Return configured SQLite synchronous mode for kanban connections."""
+    raw = os.environ.get("HERMES_KANBAN_SQLITE_SYNCHRONOUS", "FULL").strip().upper()
+    if raw in {"OFF", "NORMAL", "FULL", "EXTRA"}:
+        return raw
+    return "FULL"
 
 
 def connect(
@@ -1181,7 +1306,7 @@ def connect(
             # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
             from hermes_state import apply_wal_with_fallback
             apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute(f"PRAGMA synchronous={_sqlite_synchronous_mode()}")
             conn.execute("PRAGMA foreign_keys=ON")
             needs_init = resolved not in _INITIALIZED_PATHS
             if needs_init:
@@ -5706,19 +5831,32 @@ def run_daemon(
 
     while not stop_event.is_set():
         try:
-            with contextlib.closing(connect()) as conn:
-                res = dispatch_once(
-                    conn,
-                    max_spawn=max_spawn,
-                    failure_limit=failure_limit,
-                )
+            with board_dispatch_lock():
+                assert_board_db_healthy(force=True)
+                with contextlib.closing(connect()) as conn:
+                    res = dispatch_once(
+                        conn,
+                        max_spawn=max_spawn,
+                        failure_limit=failure_limit,
+                    )
             if on_tick is not None:
                 try:
                     on_tick(res)
                 except Exception:
                     pass
-        except Exception:
-            # Don't let any single tick kill the daemon.
+        except KanbanDispatchLockBusy:
+            # Another gateway/daemon owns this board's dispatcher tick.
+            # Skip quietly; this daemon must not compete for claims.
+            pass
+        except Exception as exc:
+            if is_corrupt_db_error(exc):
+                _log.error(
+                    "kanban daemon: board DB corruption detected; stopping dispatcher: %s",
+                    exc,
+                )
+                stop_event.set()
+                raise
+            # Don't let any single transient tick kill the daemon.
             import traceback
             traceback.print_exc()
         stop_event.wait(timeout=interval)
