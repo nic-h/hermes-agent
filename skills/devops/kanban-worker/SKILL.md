@@ -47,28 +47,22 @@ kanban_complete(
 )
 ```
 
-**Coding task that needs human review (review-required):**
+**Autonomous app-build code tasks:**
 
-For most code-changing tasks, the work isn't truly *done* until a human reviewer has eyes on it. Block instead of complete, with `reason` prefixed `review-required: ` so the dashboard surfaces the row as needing review. Drop the structured metadata (changed files, test counts, diff/PR url) into a comment first, since `kanban_block` only carries the human-readable reason — comments are the durable annotation channel. Reviewer either approves and runs `hermes kanban unblock <id>` (which re-spawns you with the comment thread for any follow-ups) or asks for changes via another comment.
+For approved app-build lanes with a builder/reviewer chain, a verified code change should be committed, pushed, and completed with structured evidence. Do not leave the repo dirty and block as `review-required` merely because code changed. Downstream reviewer cards, Browser Use QA, and controller checks are the review path.
+
+Use `review-required` only when the task explicitly asks for a human approval gate or when there is a genuine unresolved human decision you cannot infer, such as missing credentials, product/UX choice, destructive migration approval, or a peer output that is required before proceeding. If you block, keep the repo clean unless the dirty state is impossible to avoid and explain the exact blocker.
 
 ```python
-import json
-
-kanban_comment(
-    body="review-required handoff:\n" + json.dumps({
-        "changed_files": ["rate_limiter.py", "tests/test_rate_limiter.py"],
-        "tests_run": 14,
-        "tests_passed": 14,
-        "diff_path": "/path/to/worktree",  # or PR url if pushed
-        "decisions": ["user_id primary, IP fallback for unauthenticated requests"],
-    }, indent=2),
-)
-kanban_block(
-    reason="review-required: rate limiter shipped, 14/14 tests pass — needs eyes on the user_id/IP fallback choice before merging",
+kanban_complete(
+    summary="Implemented and pushed canonical storage; tests/lint/build pass.",
+    metadata={
+        "changed_files": ["src/db/schema.ts", "tests/canonical-taxonomy-storage.test.ts"],
+        "tests_run": ["npm test", "npx tsc --noEmit", "npm run lint", "npm run build"],
+        "commit": "<sha>",
+    },
 )
 ```
-
-Use `kanban_complete` only when the task is genuinely terminal — e.g. a one-line typo fix, a docs change with no functional consequences, or a research task where the artifact IS the writeup itself.
 
 **Research task:**
 ```python
