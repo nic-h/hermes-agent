@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import shlex
+import hashlib
 import sys
 import signal
 import tempfile
@@ -66,6 +67,30 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+
+_CONTROL_PLANE_DEFAULT_PLATFORMS = {"discord", "codex", "codex_app", "codex-app"}
+_CONTROL_PLANE_OFFLOAD_VERBS = {
+    "add", "audit", "build", "debug", "deliver", "deploy", "design",
+    "diagnose", "fix", "implement", "investigate", "make", "migrate",
+    "patch", "publish", "repair", "research", "restore", "review", "scrape",
+    "ship", "test", "triage", "update", "verify", "wire",
+}
+_CONTROL_PLANE_WORK_NOUNS = {
+    "agent", "api", "app", "audit", "backend", "bug", "build", "code",
+    "component", "data", "db", "debug", "deploy", "design", "feature",
+    "fix", "frontend", "generation", "implementation", "integration", "issue",
+    "job", "migration", "pipeline", "product", "project", "qa", "research",
+    "repo", "runtime", "script", "service", "site", "smoke", "task", "test",
+    "ui", "ux", "workflow",
+}
+_CONTROL_PLANE_EXPLICIT_OFFLOAD_RE = re.compile(
+    r"\b(?:kanban|worker|background|offload|async|long[-\s]?running|ship(?:ping)?\s+pass|build\s+and\s+ship)\b",
+    re.IGNORECASE,
+)
+_CONTROL_PLANE_STATUS_ONLY_RE = re.compile(
+    r"^\s*(?:status|what(?:'s| is)\s+(?:the\s+)?status|show\s+(?:me\s+)?(?:status|tasks)|list\s+(?:tasks|agents)|ping|help)\b",
+    re.IGNORECASE,
+)
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
@@ -1343,6 +1368,92 @@ def _load_gateway_config() -> dict:
     except Exception:
         logger.debug("Could not load gateway config from %s", config_path)
     return {}
+
+
+def _platform_value(platform: Any) -> str:
+    return (platform.value if hasattr(platform, "value") else str(platform or "")).strip().lower()
+
+
+def _control_plane_config(user_config: Optional[dict] = None) -> dict:
+    cfg = user_config if isinstance(user_config, dict) else _load_gateway_config()
+    raw = cfg.get("control_plane") if isinstance(cfg, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        "enabled": is_truthy_value(raw.get("enabled"), default=True),
+        "platforms": raw.get("platforms") or sorted(_CONTROL_PLANE_DEFAULT_PLATFORMS),
+        "default_assignee": str(raw.get("default_assignee") or "").strip(),
+        "max_runtime_seconds": raw.get("max_runtime_seconds"),
+        "inline_wall_timeout_seconds": raw.get("inline_wall_timeout_seconds", 180),
+        "min_words": raw.get("min_words", 4),
+        "offload_cue_words": raw.get("offload_cue_words") or [],
+    }
+
+
+def _control_plane_platform_enabled(source: Any, user_config: Optional[dict] = None) -> bool:
+    cfg = _control_plane_config(user_config)
+    if not cfg.get("enabled"):
+        return False
+    platform = _platform_value(getattr(source, "platform", None))
+    platforms = cfg.get("platforms")
+    if isinstance(platforms, str):
+        allowed = {p.strip().lower() for p in platforms.split(",") if p.strip()}
+    elif isinstance(platforms, (list, tuple, set)):
+        allowed = {str(p).strip().lower() for p in platforms if str(p).strip()}
+    else:
+        allowed = set(_CONTROL_PLANE_DEFAULT_PLATFORMS)
+    return "*" in allowed or platform in allowed
+
+
+def _control_plane_inline_wall_timeout(source: Any, user_config: Optional[dict] = None) -> Optional[float]:
+    """Return the max wall time for inline control-plane turns, or None."""
+    if not _control_plane_platform_enabled(source, user_config):
+        return None
+    cfg = _control_plane_config(user_config)
+    try:
+        timeout = float(cfg.get("inline_wall_timeout_seconds") or 0)
+    except (TypeError, ValueError):
+        timeout = 180.0
+    return timeout if timeout > 0 else None
+
+
+def _control_plane_offload_reason(text: str, user_config: Optional[dict] = None) -> Optional[str]:
+    """Return an offload reason for serious work requests on chat control planes.
+
+    This is deliberately heuristic and conservative: short/status/control asks
+    stay inline, while build/fix/research/audit/product requests become Kanban
+    work so the gateway thread is only a control plane.
+    """
+    raw = (text or "").strip()
+    if not raw or raw.startswith("/") or _CONTROL_PLANE_STATUS_ONLY_RE.search(raw):
+        return None
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_-]*", raw.lower())
+    cfg = _control_plane_config(user_config)
+    try:
+        min_words = max(1, int(cfg.get("min_words") or 4))
+    except (TypeError, ValueError):
+        min_words = 4
+    if len(words) < min_words:
+        return None
+
+    custom_cues = {str(w).strip().lower() for w in (cfg.get("offload_cue_words") or []) if str(w).strip()}
+    word_set = set(words)
+    if custom_cues and word_set.intersection(custom_cues):
+        return "control_plane_custom_cue"
+    if _CONTROL_PLANE_EXPLICIT_OFFLOAD_RE.search(raw):
+        return "control_plane_explicit_offload"
+    if word_set.intersection(_CONTROL_PLANE_OFFLOAD_VERBS) and word_set.intersection(_CONTROL_PLANE_WORK_NOUNS):
+        return "control_plane_work_request"
+    return None
+
+
+def _control_plane_task_title(text: str) -> str:
+    cleaned = " ".join((text or "").strip().split())
+    cleaned = re.sub(r"^please\s+", "", cleaned, flags=re.IGNORECASE)
+    if not cleaned:
+        cleaned = "Gateway control-plane offload"
+    if len(cleaned) > 96:
+        cleaned = cleaned[:93].rstrip() + "..."
+    return cleaned
 
 
 def _load_gateway_runtime_config() -> dict:
@@ -6569,6 +6680,108 @@ class GatewayRunner:
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _control_plane_offload_assignee(self, user_config: dict) -> str:
+        cp_cfg = _control_plane_config(user_config)
+        if cp_cfg.get("default_assignee"):
+            return str(cp_cfg["default_assignee"])
+        kb_cfg = user_config.get("kanban") if isinstance(user_config, dict) else None
+        if isinstance(kb_cfg, dict) and kb_cfg.get("default_assignee"):
+            return str(kb_cfg["default_assignee"])
+        return self._active_profile_name()
+
+    def _create_control_plane_kanban_task(
+        self,
+        *,
+        event: MessageEvent,
+        reason: str,
+        user_config: dict,
+    ) -> tuple[str, str]:
+        from hermes_cli import kanban_db as _kb
+
+        source = event.source
+        assignee = self._control_plane_offload_assignee(user_config)
+        text = event.text or ""
+        title = _control_plane_task_title(text)
+        platform = _platform_value(getattr(source, "platform", None))
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        user_id = str(getattr(source, "user_id", "") or "")
+        message_id = str(getattr(event, "message_id", "") or "")
+        digest_basis = "\n".join([platform, chat_id, thread_id, user_id, message_id, text])
+        digest = hashlib.sha256(digest_basis.encode("utf-8", "ignore")).hexdigest()[:20]
+        body = (
+            "Created automatically from a gateway control-plane message so the chat "
+            "surface stays responsive. Execute the work in a Kanban worker; do not "
+            "turn this back into an inline gateway conversation.\n\n"
+            f"Offload reason: {reason}\n"
+            f"Origin: platform={platform or 'unknown'} chat={chat_id or 'unknown'} "
+            f"thread={thread_id or 'none'} user={user_id or 'unknown'} message={message_id or 'none'}\n\n"
+            "Original request:\n"
+            f"{text.strip()}\n\n"
+            "Acceptance:\n"
+            "- Work runs in the assigned worker process, not the gateway request path.\n"
+            "- Leave durable progress and a structured Kanban completion.\n"
+            "- Notify/block through Kanban if human input is genuinely required.\n"
+        )
+        cp_cfg = _control_plane_config(user_config)
+        max_runtime = cp_cfg.get("max_runtime_seconds")
+        try:
+            max_runtime = int(max_runtime) if max_runtime not in (None, "") else None
+        except (TypeError, ValueError):
+            max_runtime = None
+
+        conn = _kb.connect()
+        try:
+            task_id = _kb.create_task(
+                conn,
+                title=title,
+                body=body,
+                assignee=assignee,
+                created_by=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
+                idempotency_key=f"gateway-control-plane:{digest}",
+                max_runtime_seconds=max_runtime,
+                initial_status="running",
+            )
+            if platform and chat_id:
+                _kb.add_notify_sub(
+                    conn,
+                    task_id=task_id,
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id or None,
+                    user_id=user_id or None,
+                    notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
+                )
+            return task_id, assignee
+        finally:
+            conn.close()
+
+    async def _maybe_offload_control_plane_work(self, event: MessageEvent) -> Optional[str]:
+        source = event.source
+        user_config = _load_gateway_config()
+        if not _control_plane_platform_enabled(source, user_config):
+            return None
+        reason = _control_plane_offload_reason(event.text or "", user_config)
+        if not reason:
+            return None
+        try:
+            task_id, assignee = await asyncio.to_thread(
+                self._create_control_plane_kanban_task,
+                event=event,
+                reason=reason,
+                user_config=user_config,
+            )
+        except Exception as exc:
+            logger.exception("control-plane Kanban offload failed")
+            return (
+                "I tried to offload this to Kanban so the gateway stayed responsive, "
+                f"but task creation failed: {type(exc).__name__}: {exc}"
+            )
+        return (
+            f"Queued as Kanban task `{task_id}` for `{assignee}`. "
+            "I subscribed this chat to completion/block updates."
+        )
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -7638,6 +7851,11 @@ class GatewayRunner:
             if self._should_send_telegram_lobby_reminder(source):
                 return self._telegram_topic_root_lobby_message()
             return None
+
+        if not is_internal and not command:
+            offload_ack = await self._maybe_offload_control_plane_work(event)
+            if offload_ack is not None:
+                return offload_ack
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
@@ -17600,6 +17818,8 @@ class GatewayRunner:
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
         _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
         _notify_start = time.time()
+        _control_plane_wall_timeout = _control_plane_inline_wall_timeout(source, user_config)
+        _control_plane_wall_timeout_hit = False
 
         async def _notify_long_running():
             if _NOTIFY_INTERVAL is None:
@@ -17674,6 +17894,12 @@ class GatewayRunner:
                     if done:
                         response = _executor_task.result()
                         break
+                    if (
+                        _control_plane_wall_timeout is not None
+                        and time.time() - _notify_start >= _control_plane_wall_timeout
+                    ):
+                        _control_plane_wall_timeout_hit = True
+                        break
                     # Backup interrupt check: if the monitor task died or
                     # missed the interrupt, catch it here.
                     if not _interrupt_detected.is_set() and session_key:
@@ -17703,6 +17929,12 @@ class GatewayRunner:
                     )
                     if done:
                         response = _executor_task.result()
+                        break
+                    if (
+                        _control_plane_wall_timeout is not None
+                        and time.time() - _notify_start >= _control_plane_wall_timeout
+                    ):
+                        _control_plane_wall_timeout_hit = True
                         break
                     # Agent still running — check inactivity.
                     _agent_ref = agent_holder[0]
@@ -17752,6 +17984,45 @@ class GatewayRunner:
                             )
                             _backup_agent.interrupt(_bp_text)
                             _interrupt_detected.set()
+
+            if _control_plane_wall_timeout_hit:
+                _timed_out_agent = agent_holder[0]
+                if _timed_out_agent and hasattr(_timed_out_agent, "interrupt"):
+                    _timed_out_agent.interrupt(_INTERRUPT_REASON_TIMEOUT)
+                _timeout_secs = int(_control_plane_wall_timeout or 0)
+                try:
+                    synthetic_event = MessageEvent(
+                        text=message if isinstance(message, str) else str(message),
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        message_id=event_message_id,
+                    )
+                    task_id, assignee = await asyncio.to_thread(
+                        self._create_control_plane_kanban_task,
+                        event=synthetic_event,
+                        reason="control_plane_inline_wall_timeout",
+                        user_config=user_config,
+                    )
+                    final = (
+                        f"Inline control-plane turn exceeded {_timeout_secs}s, so I detached it "
+                        f"to Kanban task `{task_id}` for `{assignee}`. "
+                        "This chat is subscribed to completion/block updates."
+                    )
+                except Exception as exc:
+                    logger.exception("control-plane wall-time offload failed")
+                    final = (
+                        f"Inline control-plane turn exceeded {_timeout_secs}s and was interrupted, "
+                        f"but Kanban offload failed: {type(exc).__name__}: {exc}"
+                    )
+                response = {
+                    "final_response": final,
+                    "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
+                    "api_calls": 0,
+                    "tools": tools_holder[0] or [],
+                    "history_offset": 0,
+                    "failed": True,
+                    "control_plane_wall_timeout": True,
+                }
 
             if _inactivity_timeout:
                 # Build a diagnostic summary from the agent's activity tracker.

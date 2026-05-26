@@ -1620,6 +1620,19 @@ DEFAULT_CONFIG = {
     # todos to ready, and fires `hermes -p <assignee> chat -q ...` for
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
+    "control_plane": {
+        # Keep chat/control surfaces responsive: app/build/research/audit
+        # requests on these platforms are turned into Kanban worker tasks
+        # instead of running as long inline gateway/model turns.
+        "enabled": True,
+        "platforms": ["discord", "codex", "codex_app", "codex-app"],
+        "default_assignee": "",
+        "max_runtime_seconds": None,
+        "inline_wall_timeout_seconds": 180,
+        "min_words": 4,
+        "offload_cue_words": [],
+    },
+
     "kanban": {
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
