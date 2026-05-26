@@ -33,7 +33,7 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block, sanitize_context
+from agent.memory_manager import build_active_memory_context, sanitize_context
 from agent.message_sanitization import (
     _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
@@ -819,9 +819,9 @@ def run_conversation(
             if idx == current_turn_user_idx and msg.get("role") == "user":
                 _injections = []
                 if _ext_prefetch_cache:
-                    _fenced = build_memory_context_block(_ext_prefetch_cache)
-                    if _fenced:
-                        _injections.append(_fenced)
+                    _recall_context = build_active_memory_context(_ext_prefetch_cache)
+                    if _recall_context:
+                        _injections.append(_recall_context)
                 if _plugin_user_context:
                     _injections.append(_plugin_user_context)
                 try:

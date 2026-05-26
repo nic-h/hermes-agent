@@ -349,36 +349,23 @@ class TestPeerLookupHelpers:
             search_query="assistant",
         )
 
-    def test_get_prefetch_context_fetches_user_and_ai_from_peer_api(self):
+    def test_get_prefetch_context_fetches_compact_user_context_only(self):
         mgr, session = self._make_cached_manager()
         user_peer = MagicMock()
         user_peer.context.return_value = SimpleNamespace(
             representation="User representation",
             peer_card=["Name: Robert"],
         )
-        ai_peer = MagicMock()
-        ai_peer.context.side_effect = lambda **kwargs: SimpleNamespace(
-            representation=(
-                "AI representation" if kwargs.get("target") == session.assistant_peer_id
-                else "Mixed representation"
-            ),
-            peer_card=(
-                ["Role: Assistant"] if kwargs.get("target") == session.assistant_peer_id
-                else ["Name: Robert"]
-            ),
-        )
-        mgr._get_or_create_peer = MagicMock(side_effect=[user_peer, ai_peer])
+        mgr._get_or_create_peer = MagicMock(return_value=user_peer)
 
         result = mgr.get_prefetch_context(session.key)
 
         assert result == {
             "representation": "User representation",
             "card": "Name: Robert",
-            "ai_representation": "AI representation",
-            "ai_card": "Role: Assistant",
         }
         user_peer.context.assert_called_once_with(target=session.user_peer_id)
-        ai_peer.context.assert_called_once_with(target=session.assistant_peer_id)
+        mgr._get_or_create_peer.assert_called_once_with(session.user_peer_id)
 
     def test_get_ai_representation_uses_peer_api(self):
         mgr, session = self._make_cached_manager()
@@ -1108,8 +1095,8 @@ class TestBaseContextSummary:
             "card": "Name: Eri Barrett",
         }
         formatted = provider._format_first_turn_context(ctx)
-        assert "## Session Summary" in formatted
-        assert formatted.index("Session Summary") < formatted.index("Recalled user context")
+        assert "Session summary:" in formatted
+        assert formatted.index("Peer card") < formatted.index("Recalled user context")
 
     def test_format_without_summary(self):
         """No summary key means no summary section."""
@@ -1125,6 +1112,41 @@ class TestBaseContextSummary:
         ctx = {"summary": "", "representation": "rep", "card": "card"}
         formatted = provider._format_first_turn_context(ctx)
         assert "Session Summary" not in formatted
+
+
+    def test_format_keeps_peer_card_compact_and_adds_recovery_pointer(self):
+        provider = HonchoMemoryProvider()
+        ctx = {
+            "card": "\n".join([f"Fact {i}" for i in range(20)]),
+            "representation": "Current work: memory prompt hotfix",
+        }
+
+        formatted = provider._format_first_turn_context(ctx, query="memory prompt hotfix")
+
+        assert "## Peer card (compact)" in formatted
+        assert "Fact 0" in formatted
+        assert "Fact 12" not in formatted
+        assert "honcho_context" in formatted
+        assert len(formatted) <= provider._BASE_CONTEXT_TOTAL_BUDGET_CHARS + 2
+
+    def test_format_filters_stale_unrelated_operational_observations(self):
+        provider = HonchoMemoryProvider()
+        ctx = {
+            "card": "Nic prefers terse verified status",
+            "representation": "\n".join([
+                "March 2026 gateway dispatcher incident repeated in old memory",
+                "April 2026 AIVS runtime worker restart note",
+                "Current project note: product evidence pass is preferred",
+            ]),
+        }
+
+        formatted = provider._format_first_turn_context(ctx, query="write a product evidence brief")
+
+        assert "Nic prefers terse verified status" in formatted
+        assert "Current project note" in formatted
+        assert "March 2026 gateway dispatcher incident" not in formatted
+        assert "April 2026 AIVS runtime worker restart" not in formatted
+
 
 
 class TestDialecticDepth:

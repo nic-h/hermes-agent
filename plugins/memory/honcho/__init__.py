@@ -28,6 +28,22 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_AUTO_CONTEXT_TOKENS = 900
+_AUTO_CONTEXT_SECTION_BUDGETS = {
+    "summary": (700, 6),
+    "representation": (700, 6),
+    "card": (900, 10),
+}
+_RAW_AUTO_CONTEXT_SECTION_RE = re.compile(
+    r"(?ims)^##\s*(?:User Representation|Explicit Observations|User Peer Card|"
+    r"AI Self-Representation|Recalled assistant context|AI Identity Card)\s*$"
+    r"[\s\S]*?(?=^##\s|\Z)"
+)
+_RAW_AUTO_CONTEXT_MARKER_RE = re.compile(
+    r"(?i)(?:User Representation|Explicit Observations|User Peer Card|"
+    r"AI Self-Representation|AI Identity Card)"
+)
+
 
 # ---------------------------------------------------------------------------
 # Tool schemas (moved from tools/honcho_tools.py)
@@ -465,34 +481,175 @@ class HonchoMemoryProvider(MemoryProvider):
             logger.warning("Honcho lazy session init failed: %s", e)
             return False
 
-    def _format_first_turn_context(self, ctx: dict) -> str:
-        """Format the prefetch context dict into a readable system prompt block."""
-        parts = []
+    def _compact_auto_context_section(self, text: Any, section: str) -> str:
+        """Return a bounded, marker-free auto-recall section.
 
-        # Session summary — session-scoped context, placed first for relevance
-        summary = ctx.get("summary", "")
-        if summary:
-            parts.append(f"## Session Summary\n{summary}")
+        Honcho tools can expose raw peer context on demand. Automatic injection
+        should stay small and should never surface old raw dump headings such as
+        Explicit Observations or assistant self-representation.
+        """
+        raw = sanitize_context(str(text or "")).strip()
+        if not raw:
+            return ""
+        raw = _RAW_AUTO_CONTEXT_SECTION_RE.sub("", raw)
+        max_chars, max_lines = _AUTO_CONTEXT_SECTION_BUDGETS[section]
+        lines: list[str] = []
+        for candidate in raw.splitlines():
+            line = candidate.strip()
+            if not line:
+                continue
+            if _RAW_AUTO_CONTEXT_MARKER_RE.search(line):
+                continue
+            lines.append(line)
+            if len(lines) >= max_lines:
+                break
+        compact = "\n".join(lines).strip()
+        if len(compact) > max_chars:
+            compact = compact[:max_chars].rsplit(" ", 1)[0].rstrip() + " …"
+        return compact
 
-        rep = ctx.get("representation", "")
-        if rep:
-            parts.append(f"## Recalled user context\n{rep}")
+    _BASE_CONTEXT_TOTAL_BUDGET_CHARS = 2200
+    _PEER_CARD_MAX_CHARS = 900
+    _PEER_CARD_MAX_LINES = 12
+    _RECALLED_CONTEXT_MAX_CHARS = 900
+    _RECALLED_CONTEXT_MAX_LINES = 10
+    _SUMMARY_MAX_CHARS = 500
+    _AI_CARD_MAX_CHARS = 350
+    _STALE_OPERATIONAL_RE = re.compile(
+        r"\b(?:2026-0[34]|20\d\d-0[34]|march|april)\b.*"
+        r"\b(?:incident|outage|restart|gateway|dispatcher|kanban|worker|aivs|runtime|cron)\b",
+        re.IGNORECASE,
+    )
+    _QUERY_TOKEN_RE = re.compile(r"[a-zA-Z0-9_/-]{3,}")
+    _QUERY_STOPWORDS = {
+        "the", "and", "for", "with", "this", "that", "what", "when", "where",
+        "work", "task", "please", "from", "into", "about", "your", "user",
+    }
+    _FULL_CONTEXT_POINTER = (
+        "## Full memory access\n"
+        "The full Honcho context remains durable but is intentionally not placed "
+        "in the active prompt. Use honcho_profile for the compact card, "
+        "honcho_search for focused raw excerpts, honcho_context for the full "
+        "session/peer snapshot, or honcho_reasoning for synthesized recall."
+    )
 
-        card = ctx.get("card", "")
+    @classmethod
+    def _query_terms(cls, query: str | None) -> set[str]:
+        if not query:
+            return set()
+        terms = {m.group(0).casefold() for m in cls._QUERY_TOKEN_RE.finditer(query)}
+        return {t for t in terms if t not in cls._QUERY_STOPWORDS}
+
+    @staticmethod
+    def _unique_nonempty_lines(text: str) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            key = re.sub(r"\s+", " ", line).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(line)
+        return out
+
+    @staticmethod
+    def _append_with_budget(lines: list[str], *, max_chars: int) -> str:
+        out: list[str] = []
+        used = 0
+        for line in lines:
+            candidate = line if len(line) <= 220 else line[:217].rstrip() + "..."
+            added = len(candidate) + (1 if out else 0)
+            if used + added > max_chars:
+                break
+            out.append(candidate)
+            used += added
+        return "\n".join(out)
+
+    def _compact_card(self, card: str, *, max_chars: int | None = None) -> str:
+        lines = self._unique_nonempty_lines(card)[: self._PEER_CARD_MAX_LINES]
+        return self._append_with_budget(lines, max_chars=max_chars or self._PEER_CARD_MAX_CHARS)
+
+    def _compact_recalled_text(
+        self,
+        text: str,
+        *,
+        query: str | None = None,
+        max_chars: int,
+        max_lines: int,
+    ) -> str:
+        terms = self._query_terms(query)
+        lines = []
+        for line in self._unique_nonempty_lines(text):
+            if line.lstrip("# ").casefold() in {
+                "explicit observations",
+                "user representation",
+                "user peer card",
+                "ai self-representation",
+            }:
+                continue
+            haystack = line.casefold()
+            score = sum(1 for term in terms if term in haystack)
+            if self._STALE_OPERATIONAL_RE.search(line) and score == 0:
+                continue
+            lines.append((score, line))
+
+        if terms and any(score > 0 for score, _line in lines):
+            selected = [line for score, line in lines if score > 0]
+        else:
+            selected = [line for _score, line in lines]
+        return self._append_with_budget(selected[:max_lines], max_chars=max_chars)
+
+    def _format_first_turn_context(self, ctx: dict, *, query: str | None = None) -> str:
+        """Format Honcho context into a compact active-prompt recall block.
+
+        The full Honcho context remains durable and tool-recoverable; this
+        method intentionally injects only a compact card plus a small relevant
+        slice so generic control turns don't inherit stale operational dumps.
+        """
+        parts: list[str] = []
+
+        card = self._compact_card(ctx.get("card", ""))
         if card:
-            parts.append(f"## Recalled user facts\n{card}")
+            parts.append(f"## Peer card (compact)\n{card}")
 
-        ai_rep = ctx.get("ai_representation", "")
-        if ai_rep:
-            parts.append(f"## Recalled assistant context\n{ai_rep}")
+        recent_context_parts: list[str] = []
+        summary = self._compact_recalled_text(
+            ctx.get("summary", ""),
+            query=query,
+            max_chars=self._SUMMARY_MAX_CHARS,
+            max_lines=4,
+        )
+        if summary:
+            recent_context_parts.append(f"Session summary:\n{summary}")
 
-        ai_card = ctx.get("ai_card", "")
+        rep = self._compact_recalled_text(
+            ctx.get("representation", ""),
+            query=query,
+            max_chars=self._RECALLED_CONTEXT_MAX_CHARS,
+            max_lines=self._RECALLED_CONTEXT_MAX_LINES,
+        )
+        if rep:
+            recent_context_parts.append(rep)
+
+        if recent_context_parts:
+            parts.append("## Recalled user context (recent/relevant)\n" + "\n".join(recent_context_parts))
+
+        ai_card = self._compact_card(ctx.get("ai_card", ""), max_chars=self._AI_CARD_MAX_CHARS)
         if ai_card:
-            parts.append(f"## AI Identity Card\n{ai_card}")
+            parts.append(f"## Assistant peer card (compact)\n{ai_card}")
 
         if not parts:
             return ""
-        return "\n\n".join(parts)
+
+        pointer = self._FULL_CONTEXT_POINTER
+        body_budget = max(0, self._BASE_CONTEXT_TOTAL_BUDGET_CHARS - len(pointer) - 2)
+        body = "\n\n".join(parts)
+        if len(body) > body_budget:
+            body = body[:body_budget].rsplit("\n", 1)[0].rstrip() + " …"
+        return f"{body}\n\n{pointer}"
 
     def system_prompt_block(self) -> str:
         """Return system prompt text, adapted by recall_mode.
@@ -589,7 +746,7 @@ class HonchoMemoryProvider(MemoryProvider):
         if self._manager:
             fresh_ctx = self._manager.pop_context_result(self._session_key)
             if fresh_ctx:
-                formatted = self._format_first_turn_context(fresh_ctx)
+                formatted = self._format_first_turn_context(fresh_ctx, query=query)
                 if formatted:
                     with self._base_context_lock:
                         self._base_context_cache = formatted
@@ -685,10 +842,12 @@ class HonchoMemoryProvider(MemoryProvider):
         return result
 
     def _truncate_to_budget(self, text: str) -> str:
-        """Truncate text to fit within context_tokens budget if set."""
-        if not self._config or not self._config.context_tokens:
-            return text
-        budget_chars = self._config.context_tokens * 4  # conservative char estimate
+        """Truncate auto-injected recall to a strict token budget."""
+        configured = self._config.context_tokens if self._config else None
+        budget_tokens = configured or _DEFAULT_AUTO_CONTEXT_TOKENS
+        if budget_tokens <= 0:
+            return ""
+        budget_chars = budget_tokens * 4  # conservative char estimate
         if len(text) <= budget_chars:
             return text
         # Truncate at word boundary

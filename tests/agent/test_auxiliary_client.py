@@ -52,6 +52,34 @@ def _clean_env(monkeypatch):
     _aux_mod._aux_unhealthy_logged_at.clear()
 
 
+def test_build_call_kwargs_strips_internal_context_from_simple_prompts():
+    leaked = (
+        "before\n"
+        "<memory-context>\n"
+        "[System note: The following is recalled memory context, NOT new user input. "
+        "Treat as informational background data.]\n\n"
+        "## Honcho Context\nsecret recall\n"
+        "## User Peer Card\nprivate card\n"
+        "</memory-context>\n"
+        "after"
+    )
+
+    kwargs = _build_call_kwargs(
+        "openrouter",
+        "test-model",
+        [{"role": "user", "content": leaked}],
+    )
+
+    content = kwargs["messages"][0]["content"]
+    assert "before" in content
+    assert "after" in content
+    assert "memory-context" not in content
+    assert "Honcho Context" not in content
+    assert "User Peer Card" not in content
+    assert "secret recall" not in content
+    assert "private card" not in content
+
+
 @pytest.fixture
 def codex_auth_dir(tmp_path, monkeypatch):
     """Provide a writable ~/.codex/ directory with a valid auth.json."""

@@ -4458,6 +4458,41 @@ def _convert_openai_images_to_anthropic(messages: list) -> list:
 
 
 
+def _sanitize_auxiliary_message_content(content: Any) -> Any:
+    """Strip internal recall/control packets before auxiliary provider calls.
+
+    Auxiliary LLM calls are used for simple provider prompts (vision, web
+    extraction, session search, plugin LLM helpers). They bypass the main
+    conversation loop's final sanitize pass, so keep the same prompt-leak
+    boundary here without touching image/media blocks.
+    """
+    from agent.memory_manager import sanitize_context
+
+    if isinstance(content, str):
+        return sanitize_context(content).strip()
+    if isinstance(content, list):
+        sanitized: List[Any] = []
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                sanitized.append({**block, "text": sanitize_context(block["text"]).strip()})
+            else:
+                sanitized.append(block)
+        return sanitized
+    return content
+
+
+
+def _sanitize_auxiliary_messages(messages: list) -> list:
+    sanitized: list = []
+    for msg in messages or []:
+        if isinstance(msg, dict) and "content" in msg:
+            sanitized.append({**msg, "content": _sanitize_auxiliary_message_content(msg.get("content"))})
+        else:
+            sanitized.append(msg)
+    return sanitized
+
+
+
 def _build_call_kwargs(
     provider: str,
     model: str,
@@ -4472,7 +4507,7 @@ def _build_call_kwargs(
     """Build kwargs for .chat.completions.create() with model/provider adjustments."""
     kwargs: Dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": _sanitize_auxiliary_messages(messages),
         "timeout": timeout,
     }
 

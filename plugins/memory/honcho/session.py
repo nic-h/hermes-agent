@@ -642,13 +642,14 @@ class HonchoSessionManager:
 
     def get_prefetch_context(self, session_key: str, user_message: str | None = None) -> dict[str, str]:
         """
-        Pre-fetch user and AI peer context from Honcho.
+        Pre-fetch compact user peer context from Honcho.
 
-        Fetches peer_representation and peer_card for both peers, plus the
-        session summary when available. When user_message is provided, it is
-        passed as search_query to the peer context call so Honcho returns
-        conclusions relevant to the session topic rather than the full
-        observation dump.
+        Fetches user peer representation and peer card, plus the session summary
+        when available. When user_message is provided, it is passed as
+        search_query to the peer context call so Honcho returns conclusions
+        relevant to the session topic rather than the full observation dump.
+        Assistant self-representation is intentionally not fetched for default
+        prompt injection; it remains available through explicit Honcho tools.
 
         Args:
             session_key: The session key to get context for.
@@ -656,8 +657,8 @@ class HonchoSessionManager:
                           topic-relevant context retrieval.
 
         Returns:
-            Dictionary with 'representation', 'card', 'ai_representation',
-            'ai_card', and optionally 'summary' keys.
+            Dictionary with 'representation', 'card', and optionally 'summary'
+            keys. Assistant peer context is not part of automatic injection.
         """
         session = self._cache.get(session_key)
         if not session:
@@ -684,14 +685,6 @@ class HonchoSessionManager:
             result["card"] = "\n".join(user_ctx["card"])
         except Exception as e:
             logger.warning("Failed to fetch user context from Honcho: %s", e)
-
-        # Also fetch AI peer's own representation so Hermes knows itself.
-        try:
-            ai_ctx = self._fetch_peer_context(session.assistant_peer_id, target=session.assistant_peer_id)
-            result["ai_representation"] = ai_ctx["representation"]
-            result["ai_card"] = "\n".join(ai_ctx["card"])
-        except Exception as e:
-            logger.debug("Failed to fetch AI peer context from Honcho: %s", e)
 
         return result
 
