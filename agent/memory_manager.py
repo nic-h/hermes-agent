@@ -31,6 +31,8 @@ import logging
 import os
 import re
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -112,13 +114,21 @@ _MEMORY_CONTEXT_SCOPE_NOTE = (
 _MEMORY_CONTEXT_RECOVERY_NOTE = (
     "[Full recalled context was omitted from the active provider prompt. "
     "Recover durable memory with honcho_profile, honcho_search, honcho_context, "
-    "or honcho_reasoning; spill_file={spill_file}]"
+    "or honcho_reasoning; use Obsidian/wiki for project, runbook, and session "
+    "source packets; wiki_note={wiki_note}; spill_file={spill_file}]"
+)
+_OBSIDIAN_CONTEXT_POINTER = (
+    "Project, operational, runbook, audit, source-packet, and long session facts "
+    "belong in Obsidian/wiki rather than prompt-injected memory. Check ~/wiki/projects/*.md, "
+    "~/wiki/tools/, ~/wiki/workflows/, ~/wiki/outputs/, and ~/wiki/daily/ with wiki-search "
+    "or file tools when deeper context is needed."
 )
 _MEMORY_CONTEXT_ACTIVE_POINTER = (
     "Recalled memory is available but the raw recall packet was omitted from "
     "the active prompt. Use honcho_profile for the compact card, honcho_search "
     "for focused excerpts, honcho_context for the full peer/session snapshot, "
-    "or honcho_reasoning for synthesized recall."
+    "or honcho_reasoning for synthesized recall. "
+    + _OBSIDIAN_CONTEXT_POINTER
 )
 _SAFE_ACTIVE_CONTEXT_PREFIX = (
     "Recalled memory (compact, non-authoritative; direct current user input and "
@@ -191,6 +201,59 @@ def _write_memory_context_spill(full_context: str) -> str:
         return "unavailable"
 
 
+def _obsidian_vault_path() -> Path:
+    raw = os.getenv("OBSIDIAN_VAULT_PATH") or os.getenv("HERMES_OBSIDIAN_VAULT") or "~/wiki"
+    return Path(os.path.expandvars(os.path.expanduser(raw))).resolve()
+
+
+def _redact_for_wiki(text: str) -> str:
+    try:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(text or "", force=True)
+    except Exception:
+        return "[redaction unavailable; excerpt omitted]"
+
+
+def _write_memory_context_wiki_note(full_context: str, *, raw_spill_file: str) -> str:
+    """Write a redacted Obsidian recovery note when a wiki vault is available.
+
+    Raw recall stays in the 0600 spill file; the wiki note is the durable,
+    searchable pointer layer for long context recovery and routing decisions.
+    """
+    try:
+        vault = _obsidian_vault_path()
+        if not vault.exists() or not vault.is_dir():
+            return "unavailable"
+        wiki_dir = vault / "outputs" / "memory-context-spills"
+        wiki_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        digest = hashlib.sha256(full_context.encode("utf-8")).hexdigest()[:12]
+        path = wiki_dir / f"{timestamp}-{digest}.md"
+        excerpt = _redact_for_wiki(full_context)
+        excerpt = excerpt.replace("```", "''' ")[:24_000]
+        markdown = (
+            f"# Memory context spill — {timestamp[:8]}\n\n"
+            "This note is the Obsidian recovery pointer for recalled memory that was too large or too raw for the active provider prompt. "
+            "Do not paste the raw spill wholesale into a model.\n\n"
+            f"- Raw local bundle: `{raw_spill_file}`\n"
+            "- Peer/preferences boundary: compact Honcho peer card / profile memory.\n"
+            "- Project facts boundary: `~/wiki/projects/*.md`.\n"
+            "- Runtime incidents and runbooks: `~/wiki/tools/`, `~/wiki/workflows/`, and `~/wiki/daily/`.\n"
+            "- Source packets, audits, long observations, and handoffs: `~/wiki/outputs/`.\n\n"
+            "## Redacted recalled-memory excerpt\n\n"
+            f"```text\n{excerpt}\n```\n"
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        fd = os.open(path, flags, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(markdown)
+        return str(path)
+    except Exception as e:
+        logger.debug("memory context wiki note write failed: %s", e)
+        return "unavailable"
+
+
 def sanitize_context(text: str, *, strip_fence_tags: bool = True) -> str:
     """Strip injected context blocks and system notes from provider output.
 
@@ -235,11 +298,12 @@ def build_active_memory_context(raw_context: str) -> str:
     if not clean:
         return ""
     budget = _memory_context_active_budget_bytes()
-    body_budget = max(0, budget - _utf8_len(_SAFE_ACTIVE_CONTEXT_PREFIX) - 2)
+    suffix = "\n\n" + _OBSIDIAN_CONTEXT_POINTER
+    body_budget = max(0, budget - _utf8_len(_SAFE_ACTIVE_CONTEXT_PREFIX) - _utf8_len(suffix) - 2)
     clean = _utf8_prefix(clean, body_budget)
     if not clean:
         return _MEMORY_CONTEXT_ACTIVE_POINTER
-    return f"{_SAFE_ACTIVE_CONTEXT_PREFIX}\n{clean}"
+    return f"{_SAFE_ACTIVE_CONTEXT_PREFIX}\n{clean}{suffix}"
 
 
 class StreamingContextScrubber:
@@ -481,7 +545,11 @@ def build_memory_context_block(raw_context: str) -> str:
         return base
 
     spill_file = _write_memory_context_spill(clean)
-    recovery_note = _MEMORY_CONTEXT_RECOVERY_NOTE.format(spill_file=spill_file)
+    wiki_note = _write_memory_context_wiki_note(clean, raw_spill_file=spill_file)
+    recovery_note = _MEMORY_CONTEXT_RECOVERY_NOTE.format(
+        spill_file=spill_file,
+        wiki_note=wiki_note,
+    )
     fixed = f"{open_tag}{_MEMORY_CONTEXT_SCOPE_NOTE}\n\n\n\n{recovery_note}{close_tag}"
     ellipsis = " …"
     available = max(0, budget - _utf8_len(fixed) - _utf8_len(ellipsis))

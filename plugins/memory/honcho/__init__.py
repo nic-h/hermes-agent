@@ -529,7 +529,10 @@ class HonchoMemoryProvider(MemoryProvider):
         "The full Honcho context remains durable but is intentionally not placed "
         "in the active prompt. Use honcho_profile for the compact card, "
         "honcho_search for focused raw excerpts, honcho_context for the full "
-        "session/peer snapshot, or honcho_reasoning for synthesized recall."
+        "session/peer snapshot, or honcho_reasoning for synthesized recall. "
+        "Use Obsidian/wiki for project facts, operational runbooks, source packets, "
+        "audits, and long observations: ~/wiki/projects/*.md, ~/wiki/tools/, "
+        "~/wiki/workflows/, ~/wiki/outputs/, and ~/wiki/daily/."
     )
 
     @classmethod

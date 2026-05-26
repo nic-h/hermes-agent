@@ -1127,6 +1127,9 @@ class TestBaseContextSummary:
         assert "Fact 0" in formatted
         assert "Fact 12" not in formatted
         assert "honcho_context" in formatted
+        assert "Obsidian/wiki" in formatted
+        assert "~/wiki/projects/*.md" in formatted
+        assert "~/wiki/outputs/" in formatted
         assert len(formatted) <= provider._BASE_CONTEXT_TOTAL_BUDGET_CHARS + 2
 
     def test_format_filters_stale_unrelated_operational_observations(self):

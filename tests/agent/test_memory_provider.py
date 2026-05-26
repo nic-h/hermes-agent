@@ -781,6 +781,9 @@ class TestMemoryContextFencing:
         from agent.memory_manager import build_memory_context_block
 
         monkeypatch.setenv("HERMES_MEMORY_CONTEXT_ACTIVE_BUDGET_BYTES", "1300")
+        wiki_root = tmp_path / "wiki"
+        wiki_root.mkdir()
+        monkeypatch.setenv("OBSIDIAN_VAULT_PATH", str(wiki_root))
         monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
 
         raw = ("duplicate operational observation\n" * 5) + ("unique recalled detail " * 500)
@@ -789,6 +792,7 @@ class TestMemoryContextFencing:
         assert len(result.encode("utf-8")) <= 1300
         assert result.count("duplicate operational observation") == 1
         assert "honcho_search" in result
+        assert "wiki_note=" in result
         assert "spill_file=" in result
 
         spill_files = list((tmp_path / "context_spills" / "memory-context").glob("*.txt"))
@@ -796,6 +800,14 @@ class TestMemoryContextFencing:
         spilled = spill_files[0].read_text(encoding="utf-8")
         assert "unique recalled detail" in spilled
         assert spilled.count("duplicate operational observation") == 1
+
+        wiki_notes = list((wiki_root / "outputs" / "memory-context-spills").glob("*.md"))
+        assert len(wiki_notes) == 1
+        wiki_text = wiki_notes[0].read_text(encoding="utf-8")
+        assert "Obsidian recovery pointer" in wiki_text
+        assert "Project facts boundary: `~/wiki/projects/*.md`" in wiki_text
+        assert "Runtime incidents and runbooks" in wiki_text
+        assert str(spill_files[0]) in wiki_text
 
     def test_build_active_memory_context_omits_raw_honcho_dump_with_pointer(self):
         from agent.memory_manager import build_active_memory_context
@@ -809,6 +821,8 @@ class TestMemoryContextFencing:
         result = build_active_memory_context(raw)
         assert "honcho_profile" in result
         assert "honcho_search" in result
+        assert "Obsidian/wiki" in result
+        assert "~/wiki/projects/*.md" in result
         assert "Honcho Context" not in result
         assert "User Peer Card" not in result
         assert "AI Self-Representation" not in result
@@ -825,7 +839,8 @@ class TestMemoryContextFencing:
         result = build_active_memory_context(compact)
         assert "Recalled memory (compact" in result
         assert "Nic prefers terse status" in result
-        assert "honcho_search" in result
+        assert "wiki-search" in result
+        assert "~/wiki/outputs/" in result
         assert "memory-context" not in result
 
     def test_build_memory_context_block_empty_input(self):

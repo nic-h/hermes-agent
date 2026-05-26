@@ -133,6 +133,8 @@ def test_history_and_memory_prefetch_leaks_are_not_sent_to_provider(monkeypatch)
     request_text = _request_text(captured)
     for token in FORBIDDEN:
         assert token not in request_text
+    assert "Obsidian/wiki" in request_text
+    assert "~/wiki/projects/*.md" in request_text
     assert "tiny runtime/debug control turn" in request_text
 
 
@@ -151,7 +153,8 @@ def test_compact_memory_prefetch_is_sent_without_raw_dump_markers(monkeypatch):
     request_text = _request_text(captured)
     assert "normal chat turn" in request_text
     assert "Nic prefers terse verified status" in request_text
-    assert "honcho_search" in request_text
+    assert "wiki-search" in request_text
+    assert "~/wiki/outputs/" in request_text
     for token in FORBIDDEN:
         assert token not in request_text
     assert "memory-context" not in request_text
