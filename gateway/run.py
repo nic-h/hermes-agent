@@ -87,6 +87,11 @@ _CONTROL_PLANE_EXPLICIT_OFFLOAD_RE = re.compile(
     r"\b(?:kanban|worker|background|offload|async|long[-\s]?running|ship(?:ping)?\s+pass|build\s+and\s+ship)\b",
     re.IGNORECASE,
 )
+_CONTROL_PLANE_CLAUSE_START_RE = re.compile(
+    r"(?:^|[.!?;:\n]\s*)"
+    r"(?:please\s+|can\s+you\s+|could\s+you\s+|would\s+you\s+|let'?s\s+)?"
+    r"([A-Za-z][A-Za-z0-9_-]*)\b"
+)
 _CONTROL_PLANE_STATUS_ONLY_RE = re.compile(
     r"^\s*(?:status|what(?:'s| is)\s+(?:the\s+)?status|show\s+(?:me\s+)?(?:status|tasks)|list\s+(?:tasks|agents)|ping|help)\b",
     re.IGNORECASE,
@@ -1419,6 +1424,20 @@ def _control_plane_inline_wall_timeout(source: Any, user_config: Optional[dict] 
     return timeout if timeout > 0 else None
 
 
+def _control_plane_has_clause_start_offload_verb(text: str) -> bool:
+    """Return True when a work verb appears at the start of a clause.
+
+    Some words are both verbs and nouns (``build``, ``research``, ``test``).
+    Treating one mid-sentence occurrence as both roles makes casual chat look
+    like work. Clause-start verbs preserve direct commands like "research ..."
+    without offloading "interesting research ...".
+    """
+    for match in _CONTROL_PLANE_CLAUSE_START_RE.finditer(text or ""):
+        if match.group(1).lower() in _CONTROL_PLANE_OFFLOAD_VERBS:
+            return True
+    return False
+
+
 def _control_plane_offload_reason(text: str, user_config: Optional[dict] = None) -> Optional[str]:
     """Return an offload reason for serious work requests on chat control planes.
 
@@ -1444,7 +1463,13 @@ def _control_plane_offload_reason(text: str, user_config: Optional[dict] = None)
         return "control_plane_custom_cue"
     if _CONTROL_PLANE_EXPLICIT_OFFLOAD_RE.search(raw):
         return "control_plane_explicit_offload"
-    if word_set.intersection(_CONTROL_PLANE_OFFLOAD_VERBS) and word_set.intersection(_CONTROL_PLANE_WORK_NOUNS):
+    verb_matches = word_set.intersection(_CONTROL_PLANE_OFFLOAD_VERBS)
+    noun_matches = word_set.intersection(_CONTROL_PLANE_WORK_NOUNS)
+    if verb_matches and noun_matches and (
+        (verb_matches - noun_matches)
+        or (noun_matches - verb_matches)
+        or _control_plane_has_clause_start_offload_verb(raw)
+    ):
         return "control_plane_work_request"
     return None
 

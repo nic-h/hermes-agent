@@ -47,6 +47,35 @@ def test_control_plane_build_request_is_offloaded():
     assert reason == "control_plane_work_request"
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "the build broke again last night",
+        "interesting research from anthropic",
+        "the test went well today honestly",
+        "did you see the deploy went out earlier",
+        "I think the design is great honestly",
+        "good audit results overall here",
+    ],
+)
+def test_control_plane_overlap_words_in_casual_chat_stay_inline(text):
+    assert _control_plane_offload_reason(text) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "fix the AIVS generation runtime and verify the build",
+        "research the new claude opus 5 launch and write a one pager",
+        "ship the SKU killer result bundle UI fix",
+        "build and ship the new auth flow",
+        "deploy the data pipeline to staging",
+    ],
+)
+def test_control_plane_real_work_requests_still_offload(text):
+    assert _control_plane_offload_reason(text) is not None
+
+
 def test_control_plane_disabled_or_non_control_platform_stays_inline():
     assert _control_plane_platform_enabled(
         _source(Platform.TELEGRAM),
