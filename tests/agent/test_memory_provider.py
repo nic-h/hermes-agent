@@ -803,6 +803,8 @@ class TestMemoryContextFencing:
             "## Honcho Context\n"
             "## User Peer Card\nprivate card\n"
             "## AI Self-Representation\nagent dump\n"
+            "## Recalled assistant context\nassistant context dump\n"
+            "## AI Identity Card\nidentity dump\n"
         )
         result = build_active_memory_context(raw)
         assert "honcho_profile" in result
@@ -810,8 +812,12 @@ class TestMemoryContextFencing:
         assert "Honcho Context" not in result
         assert "User Peer Card" not in result
         assert "AI Self-Representation" not in result
+        assert "Recalled assistant context" not in result
+        assert "AI Identity Card" not in result
         assert "private card" not in result
         assert "agent dump" not in result
+        assert "assistant context dump" not in result
+        assert "identity dump" not in result
 
     def test_build_active_memory_context_keeps_compact_recall(self):
         from agent.memory_manager import build_active_memory_context

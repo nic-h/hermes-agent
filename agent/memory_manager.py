@@ -80,7 +80,8 @@ _PREWRAPPED_SYSTEM_NOTE_RE = re.compile(
     re.IGNORECASE,
 )
 _RAW_MEMORY_HEADING_RE = re.compile(
-    r'^##\s*(?:Honcho Context|User Representation|Explicit Observations|User Peer Card|AI Self-Representation)\s*$',
+    r'^##\s*(?:Honcho Context|User Representation|Explicit Observations|User Peer Card|'
+    r'AI Self-Representation|Recalled assistant context|AI Identity Card)\s*$',
     re.IGNORECASE | re.MULTILINE,
 )
 _AIVS_AUTONOMOUS_LOOP_RE = re.compile(

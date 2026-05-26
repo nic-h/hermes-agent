@@ -514,7 +514,6 @@ class HonchoMemoryProvider(MemoryProvider):
     _RECALLED_CONTEXT_MAX_CHARS = 900
     _RECALLED_CONTEXT_MAX_LINES = 10
     _SUMMARY_MAX_CHARS = 500
-    _AI_CARD_MAX_CHARS = 350
     _STALE_OPERATIONAL_RE = re.compile(
         r"\b(?:2026-0[34]|20\d\d-0[34]|march|april)\b.*"
         r"\b(?:incident|outage|restart|gateway|dispatcher|kanban|worker|aivs|runtime|cron)\b",
@@ -588,6 +587,8 @@ class HonchoMemoryProvider(MemoryProvider):
                 "user representation",
                 "user peer card",
                 "ai self-representation",
+                "recalled assistant context",
+                "ai identity card",
             }:
                 continue
             haystack = line.casefold()
@@ -636,10 +637,6 @@ class HonchoMemoryProvider(MemoryProvider):
 
         if recent_context_parts:
             parts.append("## Recalled user context (recent/relevant)\n" + "\n".join(recent_context_parts))
-
-        ai_card = self._compact_card(ctx.get("ai_card", ""), max_chars=self._AI_CARD_MAX_CHARS)
-        if ai_card:
-            parts.append(f"## Assistant peer card (compact)\n{ai_card}")
 
         if not parts:
             return ""

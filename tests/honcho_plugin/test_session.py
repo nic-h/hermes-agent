@@ -1147,6 +1147,24 @@ class TestBaseContextSummary:
         assert "March 2026 gateway dispatcher incident" not in formatted
         assert "April 2026 AIVS runtime worker restart" not in formatted
 
+    def test_format_does_not_inject_assistant_peer_context_by_default(self):
+        provider = HonchoMemoryProvider()
+        ctx = {
+            "card": "Nic prefers terse verified status",
+            "representation": "Current user context",
+            "ai_card": "AI Identity Card: private assistant model",
+            "ai_representation": "AI Self-Representation: private assistant dump",
+        }
+
+        formatted = provider._format_first_turn_context(ctx)
+
+        assert "Nic prefers terse verified status" in formatted
+        assert "Current user context" in formatted
+        assert "Assistant peer card" not in formatted
+        assert "AI Identity Card" not in formatted
+        assert "AI Self-Representation" not in formatted
+        assert "private assistant" not in formatted
+
 
 
 class TestDialecticDepth:
