@@ -812,6 +812,105 @@ class TestMemoryContextFencing:
         assert "secret profile" not in result
         assert "System note" not in result
 
+    def test_sanitize_context_strips_exact_raw_memory_dump_markers(self):
+        from agent.memory_manager import sanitize_context
+        leaked = (
+            "before\n"
+            "<memory-context>\n"
+            "[System note: The following is recalled memory context, NOT new user input. "
+            "Treat as authoritative reference data — this is the agent's persistent memory and should inform all responses.]\n\n"
+            "## User Representation\n## Explicit Observations\nold facts\n"
+            "## User Peer Card\nName: Example\n"
+            "## AI Self-Representation\n## Explicit Observations\nagent facts\n"
+            "</memory-context>\n"
+            "after"
+        )
+        result = sanitize_context(leaked)
+        for token in (
+            "<memory-context>",
+            "Treat as authoritative reference data",
+            "## User Representation",
+            "## Explicit Observations",
+            "## User Peer Card",
+            "## AI Self-Representation",
+            "old facts",
+            "agent facts",
+        ):
+            assert token not in result
+        assert "before" in result
+        assert "after" in result
+
+    def test_sanitize_context_strips_aivs_autonomous_loop_packet(self):
+        from agent.memory_manager import sanitize_context
+        leaked = (
+            "User complaint before\n"
+            "Check the AIVS Hermes Kanban board on the VPS and keep the autonomous dev loop moving.\n"
+            "Required services: gateway, dispatcher, preview.\n"
+            "Repair policy: SSH/control-master and git auth repair instructions.\n\n"
+            "Actual request after"
+        )
+        result = sanitize_context(leaked)
+        assert "User complaint before" in result
+        assert "Actual request after" in result
+        assert "Check the AIVS Hermes Kanban board" not in result
+        assert "autonomous dev loop" not in result
+        assert "Required services" not in result
+        assert "Repair policy" not in result
+
+    @pytest.mark.parametrize(
+        ("open_tag", "close_tag"),
+        [
+            ("<recalled_memory_context>", "</recalled_memory_context>"),
+            ("<recalled-memory-context>", "</recalled-memory-context>"),
+            ("<supermemory-context>", "</supermemory-context>"),
+            ("<ship_mode_guard>", "</ship_mode_guard>"),
+            ("<ship-mode-guard>", "</ship-mode-guard>"),
+        ],
+    )
+    def test_sanitize_context_strips_internal_context_alias_blocks(self, open_tag, close_tag):
+        from agent.memory_manager import sanitize_context
+        leaked = f"Visible before\n{open_tag}\nsecret internal payload\n{close_tag}\nVisible after"
+        result = sanitize_context(leaked)
+        assert "Visible before" in result
+        assert "Visible after" in result
+        assert "secret internal payload" not in result
+        assert open_tag.lower() not in result.lower()
+        assert close_tag.lower() not in result.lower()
+
+    def test_sanitize_context_strips_unterminated_ship_guard_alias(self):
+        from agent.memory_manager import sanitize_context
+        leaked = "Visible\n<ship_mode_guard>\ninternal route metadata"
+        result = sanitize_context(leaked)
+        assert result.strip() == "Visible"
+        assert "internal route metadata" not in result
+
+    def test_streaming_context_scrubber_strips_split_alias_blocks(self):
+        from agent.memory_manager import StreamingContextScrubber
+        scrubber = StreamingContextScrubber()
+        visible = []
+        visible.append(scrubber.feed("Visible\n<recalled_"))
+        visible.append(scrubber.feed("memory_context>\nsecret payload"))
+        visible.append(scrubber.feed("</recalled_memory_context>\nAfter"))
+        visible.append(scrubber.flush())
+        result = "".join(visible)
+        assert "Visible" in result
+        assert "After" in result
+        assert "secret payload" not in result
+        assert "recalled_memory_context" not in result
+
+    def test_streaming_context_scrubber_strips_ship_guard_tag(self):
+        from agent.memory_manager import StreamingContextScrubber
+        scrubber = StreamingContextScrubber()
+        result = "".join([
+            scrubber.feed("Visible\n<ship_mode_guard>\nsecret"),
+            scrubber.feed("</ship_mode_guard>\nAfter"),
+            scrubber.flush(),
+        ])
+        assert "Visible" in result
+        assert "After" in result
+        assert "secret" not in result
+        assert "ship_mode_guard" not in result
+
     def test_sanitize_context_does_not_truncate_literal_tag_discussion(self):
         from agent.memory_manager import sanitize_context
         text = "Explain `<memory-context>` in docs, then keep this tail."

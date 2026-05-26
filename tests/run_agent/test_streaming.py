@@ -458,12 +458,54 @@ class TestStreamingCallbacks:
 
         # Text before tool call IS fired (we don't know yet it will have tools)
         assert "thinking..." in deltas
-        # Text after tool call IS still routed to stream_delta_callback so that
-        # reasoning tag extraction can fire (PR #3566).  Display-level suppression
-        # of non-reasoning text happens in the CLI's _stream_delta, not here.
+        # Text after tool call IS still routed through _fire_stream_delta so that
+        # reasoning tag extraction can fire without bypassing stream scrubbers.
+        # Display-level suppression of non-reasoning text happens in the CLI's
+        # _stream_delta, not here.
         assert " more text" in deltas
         # Content is still accumulated in the response
         assert response.choices[0].message.content == "thinking... more text"
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_suppressed_tool_text_uses_stream_scrubber(self, mock_close, mock_create):
+        """Tool-turn suppressed text must not bypass memory/guard scrubbers."""
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(content="thinking..."),
+            _make_stream_chunk(tool_calls=[
+                _make_tool_call_delta(index=0, tc_id="call_abc", name="read_file")
+            ]),
+            _make_stream_chunk(content="\n<ship_mode_guard>\nsecret route metadata"),
+            _make_stream_chunk(content="</ship_mode_guard>\n visible after"),
+            _make_stream_chunk(finish_reason="tool_calls"),
+        ]
+
+        deltas = []
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=lambda t: deltas.append(t),
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        agent._interruptible_streaming_api_call({})
+
+        streamed = "".join(deltas)
+        assert "thinking..." in streamed
+        assert " visible after" in streamed
+        assert "secret route metadata" not in streamed
+        assert "ship_mode_guard" not in streamed
 
 
 # ── Test: Streaming Fallback ────────────────────────────────────────────

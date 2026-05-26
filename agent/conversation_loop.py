@@ -301,8 +301,10 @@ def run_conversation(
     # that are invalid UTF-8 and crash JSON serialization in the OpenAI SDK.
     if isinstance(user_message, str):
         user_message = _sanitize_surrogates(user_message)
+        user_message = sanitize_context(user_message)
     if isinstance(persist_user_message, str):
         persist_user_message = _sanitize_surrogates(persist_user_message)
+        persist_user_message = sanitize_context(persist_user_message)
 
     # Store stream callback for _interruptible_api_call to pick up
     agent._stream_callback = stream_callback
@@ -565,9 +567,9 @@ def run_conversation(
         _ctx_parts: list[str] = []
         for r in _pre_results:
             if isinstance(r, dict) and r.get("context"):
-                _ctx_parts.append(str(r["context"]))
+                _ctx_parts.append(sanitize_context(str(r["context"])))
             elif isinstance(r, str) and r.strip():
-                _ctx_parts.append(r)
+                _ctx_parts.append(sanitize_context(r))
         if _ctx_parts:
             _plugin_user_context = "\n\n".join(_ctx_parts)
     except Exception as exc:
@@ -927,7 +929,7 @@ def run_conversation(
         # the original conversation history in `messages` is untouched.
         for am in api_messages:
             if isinstance(am.get("content"), str):
-                am["content"] = am["content"].strip()
+                am["content"] = sanitize_context(am["content"]).strip()
         for am in api_messages:
             tcs = am.get("tool_calls")
             if not tcs:
