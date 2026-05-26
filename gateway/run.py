@@ -91,6 +91,9 @@ _CONTROL_PLANE_STATUS_ONLY_RE = re.compile(
     r"^\s*(?:status|what(?:'s| is)\s+(?:the\s+)?status|show\s+(?:me\s+)?(?:status|tasks)|list\s+(?:tasks|agents)|ping|help)\b",
     re.IGNORECASE,
 )
+_CONTROL_PLANE_TASK_ACTIVE_EXCERPT_CHARS = 6_000
+_CONTROL_PLANE_TASK_ALWAYS_PACKET_THRESHOLD_CHARS = 1_500
+_CONTROL_PLANE_SOURCE_PACKET_DIRNAME = "control-plane-source-packets"
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
@@ -6709,20 +6712,40 @@ class GatewayRunner:
         message_id = str(getattr(event, "message_id", "") or "")
         digest_basis = "\n".join([platform, chat_id, thread_id, user_id, message_id, text])
         digest = hashlib.sha256(digest_basis.encode("utf-8", "ignore")).hexdigest()[:20]
-        body = (
-            "Created automatically from a gateway control-plane message so the chat "
-            "surface stays responsive. Execute the work in a Kanban worker; do not "
-            "turn this back into an inline gateway conversation.\n\n"
-            f"Offload reason: {reason}\n"
-            f"Origin: platform={platform or 'unknown'} chat={chat_id or 'unknown'} "
-            f"thread={thread_id or 'none'} user={user_id or 'unknown'} message={message_id or 'none'}\n\n"
-            "Original request:\n"
-            f"{text.strip()}\n\n"
-            "Acceptance:\n"
-            "- Work runs in the assigned worker process, not the gateway request path.\n"
-            "- Leave durable progress and a structured Kanban completion.\n"
-            "- Notify/block through Kanban if human input is genuinely required.\n"
+        should_source_packet = (
+            len(text) >= _CONTROL_PLANE_TASK_ALWAYS_PACKET_THRESHOLD_CHARS
+            or bool(getattr(event, "reply_to_text", None))
+            or bool(getattr(event, "channel_context", None))
+            or bool(getattr(event, "channel_prompt", None))
+            or bool(getattr(event, "media_urls", None))
         )
+        if should_source_packet:
+            from gateway.control_plane_source_packet import (
+                build_control_plane_task_body,
+                write_control_plane_source_packet,
+            )
+
+            packet = write_control_plane_source_packet(
+                event,
+                reason=reason,
+                active_excerpt_chars=_CONTROL_PLANE_TASK_ACTIVE_EXCERPT_CHARS,
+            )
+            body = build_control_plane_task_body(event, reason=reason, packet=packet)
+        else:
+            body = (
+                "Created automatically from a gateway control-plane message so the chat "
+                "surface stays responsive. Execute the work in a Kanban worker; do not "
+                "turn this back into an inline gateway conversation.\n\n"
+                f"Offload reason: {reason}\n"
+                f"Origin: platform={platform or 'unknown'} chat={chat_id or 'unknown'} "
+                f"thread={thread_id or 'none'} user={user_id or 'unknown'} message={message_id or 'none'}\n\n"
+                "Original request:\n"
+                f"{text.strip()}\n\n"
+                "Acceptance:\n"
+                "- Work runs in the assigned worker process, not the gateway request path.\n"
+                "- Leave durable progress and a structured Kanban completion.\n"
+                "- Notify/block through Kanban if human input is genuinely required.\n"
+            )
         cp_cfg = _control_plane_config(user_config)
         max_runtime = cp_cfg.get("max_runtime_seconds")
         try:
