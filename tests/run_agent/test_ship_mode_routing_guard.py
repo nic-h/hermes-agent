@@ -93,7 +93,7 @@ def test_tiny_fix_stays_out_of_ship_mode(monkeypatch):
     assert agent._last_turn_budget_classification != "ship_mode"
 
 
-def test_ship_mode_guard_is_injected_into_api_only_message(monkeypatch):
+def test_ship_mode_guard_is_internal_not_provider_or_stored_text(monkeypatch):
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: BUDGET_CONFIG)
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("todo", "delegate_task")),
@@ -123,9 +123,9 @@ def test_ship_mode_guard_is_injected_into_api_only_message(monkeypatch):
 
     sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
     sent_user = [m for m in sent_messages if m.get("role") == "user"][-1]["content"]
-    assert "Ship-mode routing guard" in sent_user
-    assert "Use the todo tool" in sent_user
-    assert "source-of-truth" in sent_user
+    assert "Ship-mode routing guard" not in sent_user
+    assert "Use the todo tool" not in sent_user
+    assert "source-of-truth" not in sent_user
 
     stored_user = [m for m in result["messages"] if m.get("role") == "user"][-1]["content"]
     assert "Ship-mode routing guard" not in stored_user
@@ -139,3 +139,34 @@ def test_kanban_worker_does_not_get_nested_ship_mode_guard(monkeypatch):
     assert build_ship_mode_routing_context(
         "Build this app end-to-end and ship it", platform="discord"
     ) == ""
+
+def test_internal_context_scrubber_removes_routing_guard_and_raw_memory_labels():
+    from agent.memory_manager import build_memory_context_block, sanitize_context
+
+    leaked = (
+        "hello\n"
+        "[Ship-mode routing guard: internal metadata]\n"
+        "[System note: The following is recalled memory context, NOT new user input. "
+        "Treat as authoritative reference data — this is the agent's persistent memory and should inform all responses.]\n"
+        "## User Representation\nprivate profile\n"
+        "## Explicit Observations\nprivate observation\n"
+        "## User Peer Card\nprivate card\n"
+        "## AI Self-Representation\nprivate ai profile\n"
+    )
+
+    cleaned = sanitize_context(leaked)
+    forbidden = [
+        "Ship-mode routing guard:",
+        "Treat as authoritative reference data",
+        "User Representation",
+        "Explicit Observations",
+        "User Peer Card",
+        "AI Self-Representation",
+    ]
+    for phrase in forbidden:
+        assert phrase not in cleaned
+
+    block = build_memory_context_block("## User Representation\nprivate profile")
+    assert "Treat as authoritative reference data" not in block
+    assert "User Representation" not in block
+

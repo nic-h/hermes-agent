@@ -476,15 +476,15 @@ class HonchoMemoryProvider(MemoryProvider):
 
         rep = ctx.get("representation", "")
         if rep:
-            parts.append(f"## User Representation\n{rep}")
+            parts.append(f"## Recalled user context\n{rep}")
 
         card = ctx.get("card", "")
         if card:
-            parts.append(f"## User Peer Card\n{card}")
+            parts.append(f"## Recalled user facts\n{card}")
 
         ai_rep = ctx.get("ai_representation", "")
         if ai_rep:
-            parts.append(f"## AI Self-Representation\n{ai_rep}")
+            parts.append(f"## Recalled assistant context\n{ai_rep}")
 
         ai_card = ctx.get("ai_card", "")
         if ai_card:

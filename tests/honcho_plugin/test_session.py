@@ -1109,7 +1109,7 @@ class TestBaseContextSummary:
         }
         formatted = provider._format_first_turn_context(ctx)
         assert "## Session Summary" in formatted
-        assert formatted.index("Session Summary") < formatted.index("User Representation")
+        assert formatted.index("Session Summary") < formatted.index("Recalled user context")
 
     def test_format_without_summary(self):
         """No summary key means no summary section."""
@@ -1117,7 +1117,7 @@ class TestBaseContextSummary:
         ctx = {"representation": "Eri is a developer.", "card": "Name: Eri"}
         formatted = provider._format_first_turn_context(ctx)
         assert "Session Summary" not in formatted
-        assert "User Representation" in formatted
+        assert "Recalled user context" in formatted
 
     def test_format_empty_summary_skipped(self):
         """Empty summary string should not produce a section."""

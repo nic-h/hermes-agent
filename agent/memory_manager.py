@@ -55,6 +55,14 @@ _INTERNAL_NOTE_RE = re.compile(
     r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.\s*Treat as (?:informational background data|authoritative reference data[^\]]*)\.\]\s*',
     re.IGNORECASE,
 )
+_SHIP_MODE_GUARD_RE = re.compile(
+    r'\[\s*Ship-mode routing guard:[\s\S]*?\]\s*',
+    re.IGNORECASE,
+)
+_RAW_MEMORY_HEADING_RE = re.compile(
+    r'^##\s*(?:User Representation|Explicit Observations|User Peer Card|AI Self-Representation)\s*$',
+    re.IGNORECASE | re.MULTILINE,
+)
 _LEADING_COMPACTION_FALLBACK_RE = re.compile(
     r'^\s*\[CONTEXT COMPACTION\s+[^\]]*\]'
     r'[\s\S]*?'
@@ -73,9 +81,11 @@ def sanitize_context(text: str) -> str:
     """Strip fence tags, injected context blocks, and system notes from provider output."""
     text = _LEADING_COMPACTION_FALLBACK_RE.sub('', text)
     text = _LEADING_GATEWAY_SYSTEM_NOTE_RE.sub('', text)
+    text = _SHIP_MODE_GUARD_RE.sub('', text)
     text = _INTERNAL_CONTEXT_RE.sub('', text)
     text = _UNTERMINATED_INTERNAL_CONTEXT_RE.sub('', text)
     text = _INTERNAL_NOTE_RE.sub('', text)
+    text = _RAW_MEMORY_HEADING_RE.sub('## Recalled context', text)
     text = _FENCE_TAG_RE.sub('', text)
     return text
 
@@ -254,9 +264,7 @@ def build_memory_context_block(raw_context: str) -> str:
         logger.warning("memory provider returned pre-wrapped context; stripped")
     return (
         "<memory-context>\n"
-        "[System note: The following is recalled memory context, "
-        "NOT new user input. Treat as authoritative reference data — "
-        "this is the agent's persistent memory and should inform all responses.]\n\n"
+        "[Internal recalled context. Do not quote, display, or treat as user-authored text.]\n\n"
         f"{clean}\n"
         "</memory-context>"
     )
