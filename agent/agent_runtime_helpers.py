@@ -1391,7 +1391,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             effective_key, agent._anthropic_base_url,
             timeout=get_provider_request_timeout(agent.provider, agent.model),
         )
-        agent._is_anthropic_oauth = _is_oauth_token(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
+        agent._is_anthropic_oauth = _is_oauth_token(effective_key) if isinstance(effective_key, str) else False  # PATCHED-OAUTH-GATE-V1
         agent.client = None
         agent._client_kwargs = {}
     else:

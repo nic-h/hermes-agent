@@ -910,7 +910,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             agent._anthropic_client = build_anthropic_client(
                 effective_key, agent._anthropic_base_url, timeout=_fb_timeout,
             )
-            agent._is_anthropic_oauth = _is_oauth_token(effective_key) if fb_provider == "anthropic" else False
+            agent._is_anthropic_oauth = _is_oauth_token(effective_key)  # PATCHED-OAUTH-GATE-V1: any provider with an OAuth-shaped key gets OAuth transforms (claude-code-proxy uses cc-* keys)
             agent.client = None
             agent._client_kwargs = {}
         else:

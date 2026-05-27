@@ -2139,6 +2139,21 @@ def build_anthropic_kwargs(
                         elif block.get("type") == "tool_result" and "tool_use_id" in block:
                             pass  # tool_result uses ID, not name
 
+    # The local Claude Code proxy at 127.0.0.1:42069 speaks Anthropic
+    # Messages, but rejects plain-string system prompts with
+    # `system.1: Input does not match the expected shape`. Native Anthropic
+    # accepts both strings and text-block arrays; keep this compatibility shim
+    # scoped to the local proxy so other custom endpoints retain their
+    # existing wire shape.
+    if (
+        isinstance(system, str)
+        and system.strip()
+        and base_url
+        and urlparse(base_url).hostname in {"127.0.0.1", "localhost", "::1"}
+        and urlparse(base_url).port == 42069
+    ):
+        system = [{"type": "text", "text": system}]
+
     kwargs: Dict[str, Any] = {
         "model": model,
         "messages": anthropic_messages,
