@@ -70,18 +70,21 @@ _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-
 
 _CONTROL_PLANE_DEFAULT_PLATFORMS = {"discord", "codex", "codex_app", "codex-app"}
 _CONTROL_PLANE_OFFLOAD_VERBS = {
-    "add", "audit", "build", "debug", "deliver", "deploy", "design",
-    "diagnose", "fix", "implement", "investigate", "make", "migrate",
-    "patch", "publish", "repair", "research", "restore", "review", "scrape",
-    "ship", "test", "triage", "update", "verify", "wire",
+    "add", "archive", "audit", "build", "create", "debug", "deliver",
+    "deploy", "design", "diagnose", "document", "fix", "implement",
+    "investigate", "make", "migrate", "patch", "publish", "record",
+    "repair", "research", "restore", "review", "scrape", "ship",
+    "summarize", "test", "triage", "update", "verify", "wire", "write",
 }
 _CONTROL_PLANE_WORK_NOUNS = {
     "agent", "api", "app", "audit", "backend", "bug", "build", "code",
-    "component", "data", "db", "debug", "deploy", "design", "feature",
-    "fix", "frontend", "generation", "implementation", "integration", "issue",
-    "job", "migration", "pipeline", "product", "project", "qa", "research",
-    "repo", "runtime", "script", "service", "site", "smoke", "task", "test",
-    "ui", "ux", "workflow",
+    "component", "context", "data", "db", "debug", "deploy", "design",
+    "doc", "docs", "documentation", "feature", "fix", "frontend",
+    "generation", "handoff", "implementation", "integration", "issue",
+    "job", "migration", "notes", "packet", "pipeline", "product", "project",
+    "qa", "research", "repo", "runtime", "script", "service", "site",
+    "smoke", "source", "stage", "stages", "task", "test", "ui", "ux",
+    "workflow",
 }
 _CONTROL_PLANE_EXPLICIT_OFFLOAD_RE = re.compile(
     r"\b(?:kanban|worker|background|offload|async|long[-\s]?running|ship(?:ping)?\s+pass|build\s+and\s+ship)\b",

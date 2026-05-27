@@ -47,6 +47,15 @@ def test_control_plane_build_request_is_offloaded():
     assert reason == "control_plane_work_request"
 
 
+def test_control_plane_document_handoff_request_is_offloaded_before_wall_timeout():
+    cfg = {"control_plane": {"enabled": True, "platforms": ["discord"]}}
+    reason = _control_plane_offload_reason(
+        "Is there anything over the stages that was missed? Then document all for a new handoff",
+        cfg,
+    )
+    assert reason == "control_plane_work_request"
+
+
 def test_control_plane_disabled_or_non_control_platform_stays_inline():
     assert _control_plane_platform_enabled(
         _source(Platform.TELEGRAM),
