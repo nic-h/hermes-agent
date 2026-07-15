@@ -9,6 +9,7 @@ Verifies that the agent cache correctly:
 - Preserves frozen system prompt across turns
 """
 
+import os
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -173,6 +174,54 @@ class TestExtractCacheBustingConfig:
         out = GatewayRunner._extract_cache_busting_config({})
 
         assert out["tools.registry_generation"] == 12345
+
+    def test_honcho_cache_busting_config_memoized_by_mtime(
+        self, monkeypatch, tmp_path,
+    ):
+        """Unchanged honcho.json reuses the parse result; an mtime edit does not."""
+        from types import SimpleNamespace
+
+        from gateway.run import GatewayRunner
+
+        config_path = tmp_path / "honcho.json"
+        config_path.write_text("{}")
+        parse_calls = []
+
+        class FakeConfig:
+            peer_name = "eri"
+            ai_peer = "hermes"
+            pin_peer_name = False
+            runtime_peer_prefix = "tg_"
+            user_peer_aliases = {"123": "eri"}
+
+            @classmethod
+            def from_global_config(cls, config_path=None):
+                parse_calls.append(config_path)
+                return cls()
+
+        fake_client = SimpleNamespace(
+            HonchoClientConfig=FakeConfig,
+            resolve_config_path=lambda: config_path,
+        )
+        monkeypatch.setitem(
+            __import__("sys").modules, "plugins.memory.honcho.client", fake_client,
+        )
+        monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+
+        first = GatewayRunner._extract_honcho_cache_busting_config()
+        second = GatewayRunner._extract_honcho_cache_busting_config()
+
+        assert first == second
+        assert first["honcho.user_peer_aliases"] == [("123", "eri")]
+        assert parse_calls == [config_path]
+
+        previous_mtime_ns = config_path.stat().st_mtime_ns
+        config_path.write_text('{\n  "changed": true\n}')
+        os.utime(config_path, ns=(previous_mtime_ns, previous_mtime_ns + 1))
+        third = GatewayRunner._extract_honcho_cache_busting_config()
+
+        assert third == first
+        assert parse_calls == [config_path, config_path]
 
 
 class TestAgentCacheLifecycle:
