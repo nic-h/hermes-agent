@@ -4794,6 +4794,7 @@ def release_stale_claims(
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            task_id=row["id"],
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -4876,6 +4877,7 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        task_id=task_id,
     )
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
@@ -7676,6 +7678,10 @@ class DispatchResult:
     dead/gone worker). See the reconciliation pass for details."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
+    spawn_failed: list[tuple[str, str]] = field(default_factory=list)
+    """Actually claimable tasks whose workspace resolution or worker spawn
+    failed this tick, as ``(task_id, error)`` pairs. Capacity, dependency,
+    profile, lock, and respawn-guard deferrals never enter this bucket."""
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
@@ -7894,13 +7900,153 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _process_group_alive(pgid: int) -> bool:
+    """Return whether a POSIX process group has a non-zombie member."""
+    if os.name == "nt" or not hasattr(os, "killpg"):
+        return False
+
+    # Linux killpg(..., 0) also succeeds when every remaining member is a
+    # zombie. Those processes hold no memory and cannot handle another signal,
+    # so inspect /proc and treat an all-zombie group as terminated.
+    if sys.platform == "linux":
+        try:
+            with os.scandir("/proc") as entries:
+                for entry in entries:
+                    if not entry.name.isdigit():
+                        continue
+                    try:
+                        with open(
+                            f"/proc/{entry.name}/stat", "r", encoding="utf-8"
+                        ) as stat_f:
+                            stat = stat_f.read()
+                        fields = stat[stat.rfind(")") + 2:].split()
+                        # fields starts at proc(5) state: state, ppid, pgrp.
+                        if len(fields) >= 3 and int(fields[2]) == int(pgid):
+                            if fields[0] != "Z":
+                                return True
+                    except (FileNotFoundError, PermissionError, OSError, ValueError):
+                        continue
+            return False
+        except OSError:
+            pass
+
+    try:
+        os.killpg(int(pgid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _worker_process_group(pid: int) -> Optional[int]:
+    """Return the isolated worker PGID, never the dispatcher's own group.
+
+    ``_default_spawn`` uses ``start_new_session=True``, so its PID is also its
+    session/process-group id. The equality check rejects custom spawn hooks
+    that return a child sharing some unrelated group. When the leader already
+    exited, the stored PID remains the group id while descendants are alive.
+    """
+    if os.name == "nt" or not hasattr(os, "killpg"):
+        return None
+    try:
+        own_pgid = os.getpgrp()
+    except (AttributeError, OSError):
+        return None
+    if int(pid) == int(own_pgid):
+        return None
+    try:
+        pgid = os.getpgid(int(pid))
+    except ProcessLookupError:
+        pgid = int(pid) if _process_group_alive(int(pid)) else None
+    except (AttributeError, OSError):
+        return None
+    if pgid is None or int(pgid) != int(pid) or int(pgid) == int(own_pgid):
+        return None
+    return int(pgid)
+
+
+def _worker_process_groups(pid: int, task_id: Optional[str] = None) -> list[int]:
+    """Return isolated process groups owned by one worker task.
+
+    Terminal/background tools intentionally create new sessions, so killing
+    only the worker leader's PGID is insufficient. On Linux, capture both the
+    live descendant tree and processes carrying the worker's inherited
+    ``HERMES_KANBAN_TASK`` tag. The tag also finds detached terminal children
+    after a crashed leader has already been reparented to init.
+    """
+    groups: set[int] = set()
+    leader_group = _worker_process_group(pid)
+    if leader_group is not None:
+        groups.add(leader_group)
+    if sys.platform != "linux":
+        return sorted(groups)
+
+    snapshot: dict[int, tuple[int, int]] = {}
+    tagged: set[int] = set()
+    task_marker = (
+        f"HERMES_KANBAN_TASK={task_id}".encode("utf-8")
+        if task_id
+        else None
+    )
+    try:
+        with os.scandir("/proc") as entries:
+            for entry in entries:
+                if not entry.name.isdigit():
+                    continue
+                proc_pid = int(entry.name)
+                try:
+                    with open(
+                        f"/proc/{entry.name}/stat", "r", encoding="utf-8"
+                    ) as stat_f:
+                        stat = stat_f.read()
+                    fields = stat[stat.rfind(")") + 2:].split()
+                    if len(fields) < 3:
+                        continue
+                    snapshot[proc_pid] = (int(fields[1]), int(fields[2]))
+                    if task_marker is not None:
+                        with open(f"/proc/{entry.name}/environ", "rb") as env_f:
+                            if task_marker in env_f.read().split(b"\0"):
+                                tagged.add(proc_pid)
+                except (FileNotFoundError, PermissionError, OSError, ValueError):
+                    continue
+    except OSError:
+        return sorted(groups)
+
+    owned = {int(pid)} | tagged
+    # Resolve descendants transitively from one stable process-table snapshot.
+    changed = True
+    while changed:
+        changed = False
+        for proc_pid, (parent_pid, _pgid) in snapshot.items():
+            if proc_pid not in owned and parent_pid in owned:
+                owned.add(proc_pid)
+                changed = True
+
+    try:
+        own_pgid = os.getpgrp()
+    except (AttributeError, OSError):
+        own_pgid = None
+    for proc_pid in owned:
+        proc_info = snapshot.get(proc_pid)
+        if proc_info is None:
+            continue
+        pgid = int(proc_info[1])
+        if pgid > 0 and (own_pgid is None or pgid != int(own_pgid)):
+            groups.add(pgid)
+    return sorted(groups)
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    task_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Best-effort host-local worker-tree termination for reclaim paths."""
     import signal
 
     info: dict[str, Any] = {
@@ -7909,6 +8055,9 @@ def _terminate_reclaimed_worker(
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        "process_group": None,
+        "process_groups": [],
+        "signaled_process_group": False,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
@@ -7918,9 +8067,39 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
-    kill = signal_fn if signal_fn is not None else (
-        os.kill if hasattr(os, "kill") else None
-    )
+    pgids = _worker_process_groups(int(pid), task_id) if signal_fn is None else []
+    kill: Any
+    alive: Any
+    if pgids:
+        info["process_group"] = pgids[0]
+        info["process_groups"] = pgids
+        info["signaled_process_group"] = True
+
+        def _kill_groups(_pid, sig):
+            delivered = False
+            for pgid in pgids:
+                try:
+                    os.killpg(pgid, sig)
+                    delivered = True
+                except ProcessLookupError:
+                    continue
+            if not delivered:
+                raise ProcessLookupError
+
+        def _groups_alive():
+            return any(_process_group_alive(pgid) for pgid in pgids)
+
+        kill = _kill_groups
+        alive = _groups_alive
+    else:
+        kill = signal_fn if signal_fn is not None else (
+            os.kill if hasattr(os, "kill") else None
+        )
+
+        def _pid_is_alive():
+            return _pid_alive(pid)
+
+        alive = _pid_is_alive
     if kill is None:
         return info
 
@@ -7937,12 +8116,12 @@ def _terminate_reclaimed_worker(
         return info
 
     for _ in range(10):
-        if not _pid_alive(pid):
+        if not alive():
             info["terminated"] = True
             return info
         time.sleep(0.5)
 
-    if _pid_alive(pid):
+    if alive():
         try:
             # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
             # (which maps to TerminateProcess via the stdlib shim).
@@ -7952,7 +8131,11 @@ def _terminate_reclaimed_worker(
         except (ProcessLookupError, OSError):
             return info
 
-    info["terminated"] = not _pid_alive(pid)
+    for _ in range(10):
+        if not alive():
+            break
+        time.sleep(0.05)
+    info["terminated"] = not alive()
     return info
 
 
@@ -8079,9 +8262,9 @@ def enforce_max_runtime(
 
     Runs host-local: only tasks claimed by this host are candidates
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
-    test hook; defaults to ``os.kill`` on POSIX.
+    direct-PID test hook; production POSIX cleanup signals every isolated
+    process group owned by the worker task.
     """
-    import signal
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -8109,31 +8292,17 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid, row["claim_lock"], signal_fn=signal_fn,
+            task_id=tid,
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, row["claim_lock"], now, termination,
+                reason="max_runtime_worker_alive",
+            )
+            continue
+        killed = bool(termination.get("sigkill"))
 
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, tid)
@@ -8153,6 +8322,7 @@ def enforce_max_runtime(
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
+                payload.update(termination)
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -8179,6 +8349,8 @@ def enforce_max_runtime(
                     "pid": pid,
                     "sigkill": killed,
                     "retry_status": retry_status,
+                    "process_group": termination.get("process_group"),
+                    "signaled_process_group": termination.get("signaled_process_group"),
                 },
             )
     return timed_out
@@ -8255,6 +8427,7 @@ def detect_stale_running(
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn,
+            task_id=tid,
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -8554,6 +8727,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
 
             pid = int(row["worker_pid"])
+            # The worker leader is dead, but terminal/tool descendants can
+            # still be alive in the isolated session created by _default_spawn.
+            # Reap those task-owned process groups before releasing the claim.
+            termination = _terminate_reclaimed_worker(
+                pid, row["claim_lock"], task_id=row["id"],
+            )
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
             if kind == "clean_exit":
@@ -8616,6 +8795,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+            event_payload.update(termination)
 
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
@@ -9567,8 +9747,10 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            error = f"workspace: {exc}"
+            result.spawn_failed.append((claimed.id, error))
             auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
+                conn, claimed.id, error,
                 failure_limit=failure_limit,
             )
             if auto:
@@ -9612,8 +9794,10 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            error = str(exc)
+            result.spawn_failed.append((claimed.id, error))
             auto = _record_spawn_failure(
-                conn, claimed.id, str(exc),
+                conn, claimed.id, error,
                 failure_limit=failure_limit,
             )
             if auto:
@@ -9687,8 +9871,10 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            error = f"workspace: {exc}"
+            result.spawn_failed.append((claimed.id, error))
             auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
+                conn, claimed.id, error,
                 failure_limit=failure_limit,
             )
             if auto:
@@ -9727,8 +9913,10 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            error = str(exc)
+            result.spawn_failed.append((claimed.id, error))
             auto = _record_spawn_failure(
-                conn, claimed.id, str(exc),
+                conn, claimed.id, error,
                 failure_limit=failure_limit,
             )
             if auto:

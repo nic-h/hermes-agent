@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -312,6 +313,180 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             conn.close()
     finally:
         _kb._pid_alive = original_alive
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Linux /proc task ownership is required"
+)
+@pytest.mark.live_system_guard_bypass
+def test_max_runtime_terminates_worker_descendants_without_touching_unrelated_process(
+    kanban_home,
+):
+    """Timing out a worker kills its detached child, not an unrelated group."""
+    import signal
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="timeout process tree",
+            assignee="worker",
+            max_runtime_seconds=1,
+        )
+        kb.claim_task(conn, tid)
+
+    worker_env = os.environ.copy()
+    worker_env["HERMES_KANBAN_TASK"] = tid
+    worker = None
+    unrelated = None
+    descendant_pid = None
+    try:
+        worker = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import subprocess, sys, time; "
+                    "child = subprocess.Popen([sys.executable, '-c', "
+                    "'import time; time.sleep(60)'], start_new_session=True); "
+                    "print(child.pid, flush=True); time.sleep(60)"
+                ),
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+            env=worker_env,
+            start_new_session=True,
+        )
+        unrelated = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            start_new_session=True,
+        )
+        assert worker.stdout is not None
+        descendant_pid = int(worker.stdout.readline().strip())
+
+        with kb.connect() as conn:
+            kb._set_worker_pid(conn, tid, worker.pid)
+            old_started = int(time.time()) - 30
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE task_runs SET started_at = ? "
+                    "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?)",
+                    (old_started, tid),
+                )
+
+            assert kb.enforce_max_runtime(conn) == [tid]
+
+        worker.wait(timeout=5)
+        assert not kb._pid_alive(descendant_pid), (
+            f"worker descendant {descendant_pid} survived timeout cleanup"
+        )
+        assert unrelated.poll() is None, "cleanup killed an unrelated process group"
+    finally:
+        for proc in (worker, unrelated):
+            if proc is None:
+                continue
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=5)
+        if descendant_pid is not None:
+            try:
+                os.killpg(descendant_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Linux /proc task ownership is required"
+)
+@pytest.mark.live_system_guard_bypass
+def test_crash_reap_terminates_orphaned_worker_descendant(kanban_home, monkeypatch):
+    """A dead worker leader must not leave a detached terminal child alive."""
+    import signal
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="orphan process tree", assignee="worker")
+        kb.claim_task(conn, tid)
+
+    worker_env = os.environ.copy()
+    worker_env["HERMES_KANBAN_TASK"] = tid
+    worker = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import subprocess, sys; "
+                "child = subprocess.Popen([sys.executable, '-c', "
+                "'import time; time.sleep(60)'], start_new_session=True); "
+                "print(child.pid, flush=True)"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        env=worker_env,
+        start_new_session=True,
+    )
+    assert worker.stdout is not None
+    descendant_pid = int(worker.stdout.readline().strip())
+    worker.wait(timeout=5)
+
+    try:
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+        with kb.connect() as conn:
+            kb._set_worker_pid(conn, tid, worker.pid)
+
+            assert kb.detect_crashed_workers(conn) == [tid]
+
+        deadline = time.monotonic() + 5
+        while kb._pid_alive(descendant_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not kb._pid_alive(descendant_pid), (
+            f"worker descendant {descendant_pid} survived crash reaping"
+        )
+    finally:
+        try:
+            os.killpg(descendant_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_dispatch_result_reports_genuine_spawn_failure(
+    kanban_home, all_assignees_spawnable,
+):
+    """Health telemetry receives the failed attempt from dispatch_once."""
+    def _bad_spawn(task, workspace):
+        raise RuntimeError("worker executable missing")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="broken spawn", assignee="worker")
+        result = kb.dispatch_once(conn, spawn_fn=_bad_spawn, failure_limit=10)
+
+    assert result.spawn_failed == [(tid, "worker executable missing")]
+
+
+def test_saturated_dispatch_result_does_not_report_spawn_failure(
+    kanban_home, all_assignees_spawnable,
+):
+    """A ready card held by max_in_progress is not a failed spawn."""
+    def _unexpected_spawn(task, workspace):
+        raise AssertionError("saturated dispatcher attempted a spawn")
+
+    with kb.connect() as conn:
+        running_id = kb.create_task(conn, title="already running", assignee="worker")
+        assert kb.claim_task(conn, running_id) is not None
+        ready_id = kb.create_task(conn, title="held by capacity", assignee="worker")
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=_unexpected_spawn,
+            max_in_progress=1,
+            failure_limit=10,
+        )
+
+        assert result.spawn_failed == []
+        ready_task = kb.get_task(conn, ready_id)
+        assert ready_task is not None
+        assert ready_task.status == "ready"
 
 
 
@@ -1074,13 +1249,9 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
         raise sqlite3.DatabaseError("file is not a database")
 
     async def _to_thread(fn, *args, **kwargs):
-        # PR salvage (#32857 commit 7): the dispatcher now reaps zombies at
-        # the top of each tick via ``asyncio.to_thread(_kb.reap_worker_zombies)``
-        # BEFORE the per-board tick work. Each tick now issues 3 ``to_thread``
-        # calls (reaper + ``_tick_once`` + ``_ready_nonempty``) instead of 2,
-        # so this counter must reach 6 to allow the same 2 dispatch ticks the
-        # pre-reaper test expected at 4. Connect counts in the assertion below
-        # are unchanged.
+        # The dispatcher reaps zombies before per-board work. Each tick issues
+        # three ``to_thread`` calls (reaper + auto-decompose + dispatch), so six
+        # calls allow the same two dispatch ticks exercised before the reaper.
         calls["to_thread"] += 1
         result = fn(*args, **kwargs)
         if calls["to_thread"] >= 6:
@@ -1106,13 +1277,10 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kb.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    # Auto-decompose opens the board once per tick. Dispatch opens it on the
+    # first tick, then skips the unchanged quarantined DB on the second.
+    # Health telemetry consumes DispatchResult instead of re-opening the DB.
+    assert calls["connect"] == 3
 
 
 # ---------------------------------------------------------------------------
