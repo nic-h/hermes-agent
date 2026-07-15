@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import inspect
 
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.kanban_watchers import (
+    GatewayKanbanWatchersMixin,
+    _dispatch_tick_failed_to_spawn,
+)
+from hermes_cli.kanban_db import DispatchResult
 
 KANBAN_METHODS = [
     "_kanban_notifier_watcher",
@@ -43,6 +47,41 @@ def test_watcher_loops_are_coroutines():
     # The two long-running watchers are async loops.
     assert inspect.iscoroutinefunction(GatewayKanbanWatchersMixin._kanban_notifier_watcher)
     assert inspect.iscoroutinefunction(GatewayKanbanWatchersMixin._kanban_dispatcher_watcher)
+
+
+def test_dispatch_health_ignores_legitimately_held_ready_work():
+    """Capacity, dependency, and respawn holds are idle, not spawn failures."""
+    results = [
+        # Global max_in_progress / max_spawn and dependency gates leave no
+        # attempted spawn in the real dispatch result.
+        ("global-or-dependency", DispatchResult()),
+        (
+            "profile-cap",
+            DispatchResult(
+                skipped_per_profile_capped=[("t_profile", "builder", 1)],
+            ),
+        ),
+        (
+            "respawn-guard",
+            DispatchResult(respawn_guarded=[("t_guarded", "active_pr")]),
+        ),
+    ]
+
+    assert _dispatch_tick_failed_to_spawn(results) is False
+
+
+def test_dispatch_health_counts_genuine_spawn_failure():
+    results = [
+        (
+            "default",
+            DispatchResult(
+                spawned=[("t_healthy", "builder", "/tmp/work")],
+                spawn_failed=[("t_broken", "executable not found")],
+            ),
+        ),
+    ]
+
+    assert _dispatch_tick_failed_to_spawn(results) is True
 
 
 def test_singleton_dispatcher_lock_is_exclusive(tmp_path):

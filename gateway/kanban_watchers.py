@@ -109,6 +109,20 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _dispatch_tick_failed_to_spawn(results: Any) -> bool:
+    """True only when dispatch reached a claimable card and spawn failed.
+
+    DispatchResult is the eligibility source of truth. Re-querying the raw
+    ready queue loses capacity, lock, dependency, profile, and respawn-guard
+    decisions and mislabels legitimately saturated boards as stuck.
+    """
+    return any(
+        bool(getattr(result, "spawn_failed", ()))
+        for _slug, result in (results or [])
+        if result is not None
+    )
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -1077,40 +1091,6 @@ class GatewayKanbanWatchersMixin:
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
-        def _ready_nonempty() -> bool:
-            """Cheap probe: is there at least one ready+assigned+unclaimed
-            task on ANY board whose assignee maps to a real Hermes profile
-            (i.e. one the dispatcher would actually spawn for)?
-
-            Tasks assigned to control-plane lanes (e.g. ``orion-cc``,
-            ``orion-research``) are pulled by terminals via
-            ``claim_task`` directly and never spawnable, so a queue full
-            of those is "correctly idle", not "stuck". Filtering them out
-            here keeps the stuck-warn fire only on real failures (broken
-            PATH, missing venv, credential loss for a real Hermes profile).
-            """
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                conn = None
-                try:
-                    conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _kb.has_spawnable_review(conn):
-                        return True
-                except Exception:
-                    continue
-                finally:
-                    if conn is not None:
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-            return False
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
@@ -1250,9 +1230,11 @@ class GatewayKanbanWatchersMixin:
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
-                # Health telemetry (aggregate across boards)
-                ready_pending = await asyncio.to_thread(_ready_nonempty)
-                if ready_pending and not any_spawned:
+                # Health telemetry consumes the actual dispatch decisions.
+                # Raw ready rows can be legitimately held by concurrency caps,
+                # dependency state, lock contention, or respawn guards.
+                failed_to_spawn = _dispatch_tick_failed_to_spawn(results)
+                if failed_to_spawn:
                     bad_ticks += 1
                 else:
                     bad_ticks = 0
@@ -1260,8 +1242,8 @@ class GatewayKanbanWatchersMixin:
                     now = int(time.time())
                     if now - last_warn_at >= 300:
                         logger.warning(
-                            "kanban dispatcher stuck: ready queue non-empty for "
-                            "%d consecutive ticks but 0 workers spawned. Check "
+                            "kanban dispatcher stuck: claimable work failed to spawn for "
+                            "%d consecutive ticks. Check "
                             "profile health (venv, PATH, credentials) and "
                             "`hermes kanban list --status ready`.",
                             bad_ticks,
