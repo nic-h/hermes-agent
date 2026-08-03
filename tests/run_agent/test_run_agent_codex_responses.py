@@ -1582,6 +1582,23 @@ def test_interim_commentary_is_not_marked_already_streamed_without_callbacks(mon
     }
 
 
+def test_interim_visible_text_accepts_structured_assistant_content(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    assistant_msg = {
+        "role": "assistant",
+        "content": [
+            {"type": "reasoning", "text": "hidden reasoning"},
+            {"type": "tool_call", "text": "hidden tool payload"},
+            {
+                "type": "output_text",
+                "text": "<think>hidden inline reasoning</think>visible progress",
+            },
+        ],
+    }
+
+    assert agent._interim_assistant_visible_text(assistant_msg) == "visible progress"
+
+
 
 
 def test_interim_content_was_streamed_matches_prefix_not_exact(monkeypatch):

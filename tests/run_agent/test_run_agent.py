@@ -375,6 +375,48 @@ class TestStripThinkBlocks:
         assert "visible answer" in result
         assert "internal reasoning" not in result
 
+    def test_structured_text_blocks_are_joined_before_stripping(self, agent):
+        content = [
+            {"type": "text", "text": "first line"},
+            {
+                "type": "output_text",
+                "text": "<think>private reasoning</think>second line",
+            },
+        ]
+
+        assert agent._strip_think_blocks(content) == "first line\nsecond line"
+
+    def test_structured_dict_text_is_stripped(self, agent):
+        content = {
+            "type": "output_text",
+            "text": "<reasoning>private</reasoning>visible answer",
+        }
+
+        assert agent._strip_think_blocks(content) == "visible answer"
+
+    def test_structured_non_text_blocks_stay_hidden(self, agent):
+        content = [
+            {"type": "reasoning", "text": "hidden reasoning"},
+            {"type": "summary_text", "text": "hidden summary"},
+            {"type": "tool_call", "text": "hidden tool payload"},
+            {"type": "image_url", "image_url": {"url": "https://example.test/x"}},
+            {"type": "output_text", "text": "visible answer"},
+        ]
+
+        assert agent._strip_think_blocks(content) == "visible answer"
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            42,
+            {"unexpected": {"text": "do not stringify me"}},
+            {"type": "output_text", "text": {"nested": "not text"}},
+            [{"type": "unknown", "text": "do not expose me"}, object()],
+        ],
+    )
+    def test_malformed_structured_content_returns_empty(self, agent, content):
+        assert agent._strip_think_blocks(content) == ""
+
 
 
 

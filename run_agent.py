@@ -151,7 +151,6 @@ from agent.memory_manager import sanitize_context
 from agent.memory_provider import is_trivial_prompt
 from agent.error_classifier import FailoverReason
 from agent.redact import redact_sensitive_text
-from agent.message_content import flatten_message_text
 from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
     estimate_request_tokens_rough,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.estimate_request_tokens_rough")
@@ -1676,7 +1675,7 @@ class AIAgent:
         # Check if there's any non-whitespace content remaining
         return bool(cleaned.strip())
 
-    def _strip_think_blocks(self, content: str) -> str:
+    def _strip_think_blocks(self, content: Any) -> str:
         """Forwarder — see ``agent.agent_runtime_helpers.strip_think_blocks``."""
         from agent.agent_runtime_helpers import strip_think_blocks
         return strip_think_blocks(self, content)
@@ -6317,13 +6316,13 @@ class AIAgent:
         in that shape leaks the answer before the tool call runs.
 
         Content may be a string or a structured parts list (e.g. after vision
-        turns or context compaction), so flatten it before stripping reasoning.
+        turns or context compaction), so normalize it while stripping reasoning.
         """
         visible = self._extract_codex_interim_visible_text(assistant_msg)
         if visible:
             return visible
         content = assistant_msg.get("content")
-        return self._strip_think_blocks(flatten_message_text(content)).strip()
+        return self._strip_think_blocks(content).strip()
 
     def _interim_text_was_delivered(self, text: str) -> bool:
         normalized = self._normalize_interim_visible_text(text)
