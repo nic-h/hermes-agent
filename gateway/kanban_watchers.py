@@ -25,6 +25,91 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+_KANBAN_STATUS_SILENCE_SECONDS = 600
+_KANBAN_STATUS_RESERVATION_SECONDS = 60
+_KANBAN_NOTIFIER_STATUS_DDL = """
+CREATE TABLE IF NOT EXISTS kanban_notifier_status (
+    task_id          TEXT NOT NULL,
+    platform         TEXT NOT NULL,
+    chat_id          TEXT NOT NULL,
+    thread_id        TEXT NOT NULL DEFAULT '',
+    last_visible_at  INTEGER NOT NULL,
+    reservation      TEXT,
+    reserved_at      INTEGER,
+    PRIMARY KEY (task_id, platform, chat_id, thread_id)
+)
+"""
+
+
+def _kanban_event_is_visible_status(event: Any) -> bool:
+    """Return whether an event produces a user-visible START/STATUS message."""
+    if event.kind == "claimed":
+        return True
+    if event.kind != "heartbeat":
+        return False
+    note = event.payload.get("note") if event.payload else None
+    return bool(str(note).strip()) if note is not None else False
+
+
+def _kanban_status_key(sub: dict) -> tuple[str, str, str, str]:
+    return (
+        sub["task_id"], sub["platform"], sub["chat_id"],
+        sub.get("thread_id") or "",
+    )
+
+
+def _kanban_init_notifier_status(conn: sqlite3.Connection) -> None:
+    """Create notifier-owned delivery state and remove orphaned rows."""
+    conn.execute(_KANBAN_NOTIFIER_STATUS_DDL)
+    conn.execute(
+        """
+        DELETE FROM kanban_notifier_status
+        WHERE NOT EXISTS (
+            SELECT 1 FROM kanban_notify_subs AS sub
+            WHERE sub.task_id = kanban_notifier_status.task_id
+              AND sub.platform = kanban_notifier_status.platform
+              AND sub.chat_id = kanban_notifier_status.chat_id
+              AND sub.thread_id = kanban_notifier_status.thread_id
+        )
+        """
+    )
+    conn.commit()
+
+
+def _kanban_claim_still_working(
+    conn: sqlite3.Connection,
+    sub: dict,
+    now: int,
+) -> Optional[str]:
+    """Seed restart-safe state and atomically reserve an overdue update."""
+    key = _kanban_status_key(sub)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_notifier_status
+            (task_id, platform, chat_id, thread_id, last_visible_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (*key, now),
+    )
+    reservation = f"{os.getpid()}:{time.time_ns()}"
+    claimed = conn.execute(
+        """
+        UPDATE kanban_notifier_status
+        SET reservation = ?, reserved_at = ?
+        WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+          AND last_visible_at <= ?
+          AND (reservation IS NULL OR reserved_at <= ?)
+        """,
+        (
+            reservation, now, *key,
+            now - _KANBAN_STATUS_SILENCE_SECONDS,
+            now - _KANBAN_STATUS_RESERVATION_SECONDS,
+        ),
+    ).rowcount
+    conn.commit()
+    return reservation if claimed == 1 else None
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -153,17 +238,19 @@ class GatewayKanbanWatchersMixin:
         _release_singleton_lock(handle)
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
-        """Poll ``kanban_notify_subs`` and deliver terminal events to users.
+        """Poll ``kanban_notify_subs`` and deliver lifecycle events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
-        stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``,
-        ``review_requested``, ``block_loop_detected``). Sends one
-        message per new event to ``(platform, chat_id, thread_id)``,
-        then advances the cursor. The subscription is removed only when the
-        task reaches a truly final *status* (``done`` / ``archived``), not on
-        any terminal event kind — so review cycles and re-block loops keep
-        notifying.
+        stored cursor for visible lifecycle states. ``claimed`` becomes START,
+        a noted ``heartbeat`` becomes meaningful STATUS, and terminal events
+        become BLOCKED or DONE. Unnoted automatic heartbeats stay silent while
+        still advancing the cursor. A running task that has surfaced no
+        lifecycle status for 600 seconds emits one concise STATUS: STILL WORKING
+        update. The notifier tracks the last successful START/STATUS delivery
+        per subscription so automatic heartbeats cannot spam it. Review requests,
+        review cycles, and re-block loops remain visible. The subscription is
+        removed only when the task reaches a truly final status (``done`` or
+        ``archived``).
 
         Runs in the gateway event loop; all SQLite work is pushed to a
         thread via ``asyncio.to_thread`` so the loop never blocks on the
@@ -187,12 +274,15 @@ class GatewayKanbanWatchersMixin:
             return
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
-        # writes — surface those transitions to subscribers too.
+        # writes — surface those transitions to subscribers too. Claimed and
+        # noted heartbeat events provide the START/STATUS lifecycle contract.
         # ``review_requested`` wakes the origin subscriber like a block does,
-        # but is not a block (see kanban_db.request_review); the task is not
-        # done/archived, so the subscription stays alive and later review
-        # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        # but is not itself a block.
+        NOTIFY_KINDS = (
+            "claimed", "heartbeat", "completed", "blocked", "gave_up",
+            "crashed", "timed_out", "status", "archived", "unblocked",
+            "block_loop_detected", "review_requested",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -232,6 +322,7 @@ class GatewayKanbanWatchersMixin:
             try:
                 def _collect():
                     deliveries: list[dict] = []
+                    now = int(time.time())
                     include_unowned = self._owns_kanban_dispatcher_lock()
                     notifier_profiles = {notifier_profile}
                     notifier_profiles.update(
@@ -331,6 +422,7 @@ class GatewayKanbanWatchersMixin:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
+                            _kanban_init_notifier_status(conn)
                             subs = _kb.list_notify_subs(
                                 conn,
                                 notifier_profiles=notifier_profiles,
@@ -362,11 +454,25 @@ class GatewayKanbanWatchersMixin:
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
-                                        kinds=TERMINAL_KINDS,
+                                        kinds=NOTIFY_KINDS,
                                     )
-                                    if not events:
-                                        continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    has_visible_status = any(
+                                        _kanban_event_is_visible_status(ev)
+                                        for ev in events
+                                    )
+                                    running_without_status = bool(
+                                        task is not None
+                                        and task.status == "running"
+                                        and not has_visible_status
+                                    )
+                                    status_reservation = (
+                                        _kanban_claim_still_working(conn, sub, now)
+                                        if running_without_status else None
+                                    )
+                                    still_working_due = status_reservation is not None
+                                    if not events and not still_working_due:
+                                        continue
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -378,6 +484,9 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        "now": now,
+                                        "still_working_due": still_working_due,
+                                        "status_reservation": status_reservation,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -405,6 +514,11 @@ class GatewayKanbanWatchersMixin:
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
+                        if d.get("status_reservation"):
+                            await asyncio.to_thread(
+                                self._kanban_status_rollback,
+                                sub, d["status_reservation"], board_slug,
+                            )
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
                     # Route via the SAME chokepoint the authorization path uses
@@ -429,6 +543,11 @@ class GatewayKanbanWatchersMixin:
                             d.get("old_cursor", 0),
                             board_slug,
                         )
+                        if d.get("status_reservation"):
+                            await asyncio.to_thread(
+                                self._kanban_status_rollback,
+                                sub, d["status_reservation"], board_slug,
+                            )
                         continue
                     title = (task.title if task else sub["task_id"])[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
@@ -440,14 +559,41 @@ class GatewayKanbanWatchersMixin:
                         sub["task_id"], sub["platform"],
                         sub["chat_id"], sub.get("thread_id") or "",
                     )
-                    for ev in d["events"]:
-                        kind = ev.kind
-                        # Identity prefix: attribute terminal pings to the
+                    delivery_events: list[tuple[str, Any]] = [
+                        (event.kind, event) for event in d["events"]
+                    ]
+                    if d.get("still_working_due"):
+                        delivery_events.append(("still_working", None))
+                    for kind, ev in delivery_events:
+                        # Identity prefix: attribute lifecycle pings to the
                         # worker that did the work. Makes fleets (where one
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        if kind == "claimed":
+                            msg = (
+                                f"START: {board_tag}{tag}Kanban "
+                                f"{sub['task_id']} — {title}"
+                            )
+                        elif kind == "still_working":
+                            msg = (
+                                f"STATUS: STILL WORKING — {board_tag}{tag}"
+                                f"Kanban {sub['task_id']} — {title}"
+                            )
+                        elif kind == "heartbeat":
+                            note = ""
+                            if ev.payload and ev.payload.get("note"):
+                                note = str(ev.payload["note"]).strip()
+                            if not note:
+                                # Automatic tool-call heartbeats prove liveness
+                                # but contain no useful human status. Consume
+                                # them without spamming the subscription.
+                                continue
+                            msg = (
+                                f"STATUS: {board_tag}{tag}Kanban {sub['task_id']} — "
+                                f"{note[:240]}"
+                            )
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -466,14 +612,17 @@ class GatewayKanbanWatchersMixin:
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\n{r}"
                             msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
+                                f"DONE: {board_tag}{tag}Kanban {sub['task_id']}"
                                 f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                            msg = (
+                                f"BLOCKED: {board_tag}{tag}Kanban "
+                                f"{sub['task_id']} blocked{reason}"
+                            )
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -516,7 +665,7 @@ class GatewayKanbanWatchersMixin:
                             # human decision. This is the ONE transition that
                             # exists to force human attention, yet it emits no
                             # `blocked`/`status` event — so before adding it to
-                            # TERMINAL_KINDS it produced zero notification and
+                            # NOTIFY_KINDS it produced zero notification and
                             # the task stalled in triage silently. Ping loudly.
                             reason = ""
                             recurrences = None
@@ -530,7 +679,7 @@ class GatewayKanbanWatchersMixin:
                                 f" — needs a human decision{rc}{reason}"
                             )
                         else:
-                            # archived / unblocked are claimed by TERMINAL_KINDS
+                            # archived / unblocked are claimed by NOTIFY_KINDS
                             # (so the cursor advances past them and they can't
                             # wedge a later completed/blocked event behind an
                             # unclaimed row) but are intentionally SILENT: an
@@ -589,6 +738,15 @@ class GatewayKanbanWatchersMixin:
                                     "adapter send() reported failure: "
                                     f"{getattr(_send_res, 'error', None) or 'unknown error'}"
                                 )
+                            if kind in {"claimed", "heartbeat", "still_working"}:
+                                await asyncio.to_thread(
+                                    self._kanban_status_delivered,
+                                    sub,
+                                    d["now"],
+                                    d.get("status_reservation")
+                                    if kind == "still_working" else None,
+                                    board_slug,
+                                )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -636,6 +794,11 @@ class GatewayKanbanWatchersMixin:
                                 await asyncio.to_thread(self._kanban_unsub, sub, board_slug)
                                 sub_fail_counts.pop(sub_key, None)
                             else:
+                                if d.get("status_reservation"):
+                                    await asyncio.to_thread(
+                                        self._kanban_status_rollback,
+                                        sub, d["status_reservation"], board_slug,
+                                    )
                                 await asyncio.to_thread(
                                     self._kanban_rewind,
                                     sub,
@@ -755,7 +918,7 @@ class GatewayKanbanWatchersMixin:
                         # gave_up / crashed / timed_out the subscription is
                         # kept alive so the user gets notified again if the
                         # dispatcher respawns the task and it cycles into the
-                        # same state. See the longer comment on TERMINAL_KINDS
+                        # same state. See the longer comment on NOTIFY_KINDS
                         # above for the failure mode this prevents.
                         if _is_push_adapter and _wake_kinds and _session_key:
                             try:
@@ -855,6 +1018,7 @@ class GatewayKanbanWatchersMixin:
         from hermes_cli import kanban_db as _kb
         conn = _kb.connect(board=board)
         try:
+            _kanban_init_notifier_status(conn)
             _kb.remove_notify_sub(
                 conn,
                 task_id=sub["task_id"],
@@ -862,6 +1026,78 @@ class GatewayKanbanWatchersMixin:
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
             )
+            conn.execute(
+                """
+                DELETE FROM kanban_notifier_status
+                WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                """,
+                _kanban_status_key(sub),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _kanban_status_delivered(
+        self,
+        sub: dict,
+        delivered_at: int,
+        reservation: Optional[str],
+        board: Optional[str] = None,
+    ) -> None:
+        """Persist a successful visible delivery, CASing synthetic claims."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kanban_init_notifier_status(conn)
+            key = _kanban_status_key(sub)
+            if reservation is not None:
+                conn.execute(
+                    """
+                    UPDATE kanban_notifier_status
+                    SET last_visible_at = ?, reservation = NULL, reserved_at = NULL
+                    WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                      AND reservation = ?
+                    """,
+                    (delivered_at, *key, reservation),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO kanban_notifier_status
+                        (task_id, platform, chat_id, thread_id, last_visible_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(task_id, platform, chat_id, thread_id) DO UPDATE SET
+                        last_visible_at = excluded.last_visible_at,
+                        reservation = NULL,
+                        reserved_at = NULL
+                    """,
+                    (*key, delivered_at),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _kanban_status_rollback(
+        self,
+        sub: dict,
+        reservation: str,
+        board: Optional[str] = None,
+    ) -> None:
+        """Release a synthetic-delivery reservation after delivery failure."""
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect(board=board)
+        try:
+            _kanban_init_notifier_status(conn)
+            conn.execute(
+                """
+                UPDATE kanban_notifier_status
+                SET reservation = NULL, reserved_at = NULL
+                WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                  AND reservation = ?
+                """,
+                (*_kanban_status_key(sub), reservation),
+            )
+            conn.commit()
         finally:
             conn.close()
 

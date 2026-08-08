@@ -516,3 +516,209 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def test_kanban_notifier_reports_start_and_meaningful_status(tmp_path, monkeypatch):
+    db_path = tmp_path / "lifecycle.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="visible lifecycle", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.heartbeat_worker(
+            conn,
+            tid,
+            note="done: route patch; doing: tests; next: receipt",
+        )
+        # Automatic heartbeats are intentionally silent.
+        assert kb.heartbeat_worker(conn, tid, note=None)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    texts = [item["text"] for item in adapter.sent]
+    assert len(texts) == 2
+    assert texts[0].startswith("START:")
+    assert texts[1].startswith("STATUS:")
+    assert "done: route patch; doing: tests; next: receipt" in texts[1]
+
+
+def test_kanban_notifier_emits_still_working_at_600s_without_spam(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "silence-guarantee.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    clock = [1_000]
+    monkeypatch.setattr("gateway.kanban_watchers.time.time", lambda: clock[0])
+    monkeypatch.setattr("hermes_cli.kanban_db.time.time", lambda: clock[0])
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="bounded silence", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.claim_task(conn, tid) is not None
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert [item["text"].split(":", 1)[0] for item in adapter.sent] == ["START"]
+
+    # Automatic liveness at 599s advances the event cursor but is not a
+    # meaningful human status and must not defer the notifier-side guarantee.
+    clock[0] = 1_599
+    conn = kb.connect()
+    try:
+        assert kb.heartbeat_worker(conn, tid, note=None)
+    finally:
+        conn.close()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+
+    clock[0] = 1_600
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 2
+    assert adapter.sent[-1]["text"].startswith("STATUS: STILL WORKING")
+
+    # Repeated automatic liveness one second later must not repeat the update.
+    clock[0] = 1_601
+    conn = kb.connect()
+    try:
+        assert kb.heartbeat_worker(conn, tid, note=None)
+    finally:
+        conn.close()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 2
+
+    # A meaningful worker note is user-visible STATUS and resets the silence
+    # window independently of the automatic heartbeat cadence.
+    clock[0] = 2_000
+    conn = kb.connect()
+    try:
+        assert kb.heartbeat_worker(conn, tid, note="still running focused tests")
+    finally:
+        conn.close()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 3
+    assert adapter.sent[-1]["text"].startswith("STATUS:")
+
+    clock[0] = 2_200
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 3
+
+    clock[0] = 2_600
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 4
+    assert adapter.sent[-1]["text"].startswith("STATUS: STILL WORKING")
+
+
+def test_kanban_notifier_restart_seeds_old_running_subscription_without_burst(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "restart-seed.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    clock = [1_000]
+    monkeypatch.setattr("gateway.kanban_watchers.time.time", lambda: clock[0])
+    monkeypatch.setattr("hermes_cli.kanban_db.time.time", lambda: clock[0])
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="already running", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    clock[0] = 10_000
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    # The subscription was added after claim, so its cursor intentionally
+    # starts past the historical START event. A restarted notifier seeds its
+    # local silence clock without bursting a synthetic status immediately.
+    assert adapter.sent == []
+
+    clock[0] = 10_599
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert adapter.sent == []
+
+    clock[0] = 10_600
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["text"].startswith("STATUS: STILL WORKING")
+
+
+def test_kanban_notifier_restart_rolls_back_failed_still_working_reservation(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "restart-send-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    clock = [1_000]
+    monkeypatch.setattr("gateway.kanban_watchers.time.time", lambda: clock[0])
+    monkeypatch.setattr("hermes_cli.kanban_db.time.time", lambda: clock[0])
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="retry status", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+    finally:
+        conn.close()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(RecordingAdapter())))
+    clock[0] = 1_600
+    failing = FailingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(failing)))
+    assert failing.attempts == 1
+
+    recording = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recording)))
+    assert len(recording.sent) == 1
+    assert recording.sent[0]["text"].startswith("STATUS: STILL WORKING")
+
+    clock[0] = 2_199
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recording)))
+    assert len(recording.sent) == 1
+    clock[0] = 2_200
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recording)))
+    assert len(recording.sent) == 2
+
+
+def test_kanban_notifier_terminal_labels_include_handoff(tmp_path, monkeypatch):
+    db_path = tmp_path / "terminal-labels.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        done_id = kb.create_task(conn, title="finished task", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=done_id, platform="telegram", chat_id="chat-1",
+        )
+        kb.complete_task(conn, done_id, summary="Receipt: /tmp/kanban-receipt.md")
+
+        blocked_id = kb.create_task(conn, title="blocked task", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=blocked_id, platform="telegram", chat_id="chat-1",
+        )
+        kb.block_task(conn, blocked_id, reason="missing named approval")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    texts = [item["text"] for item in adapter.sent]
+    assert any(
+        text.startswith("DONE:") and "/tmp/kanban-receipt.md" in text
+        for text in texts
+    )
+    assert any(text.startswith("BLOCKED:") for text in texts)
