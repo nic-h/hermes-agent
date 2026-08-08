@@ -1649,6 +1649,50 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _filter_unrouted_discord_targets(
+    job: dict,
+    targets: List[dict],
+) -> tuple[List[dict], int]:
+    """Drop broad Discord noise while preserving explicitly named targets."""
+    deliver = _normalize_deliver_value(job.get("deliver", "local"))
+    explicit: set[tuple[str, str, Optional[str]]] = set()
+    for part in (value.strip() for value in deliver.split(",")):
+        if not part.casefold().startswith("discord:"):
+            continue
+        resolved = _resolve_single_delivery_target(job, part)
+        if resolved is not None:
+            explicit.add(
+                (
+                    "discord",
+                    str(resolved.get("chat_id") or ""),
+                    (
+                        str(resolved["thread_id"])
+                        if resolved.get("thread_id") is not None
+                        else None
+                    ),
+                )
+            )
+
+    kept: List[dict] = []
+    suppressed = 0
+    for target in targets:
+        platform = str(target.get("platform") or "").casefold()
+        key = (
+            platform,
+            str(target.get("chat_id") or ""),
+            (
+                str(target["thread_id"])
+                if target.get("thread_id") is not None
+                else None
+            ),
+        )
+        if platform != "discord" or key in explicit:
+            kept.append(target)
+        else:
+            suppressed += 1
+    return kept, suppressed
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1661,6 +1705,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     Returns None on success, or an error string on failure.
     """
     targets = _resolve_delivery_targets(job)
+    if job.get("_discord_alert_suppress_unrouted"):
+        targets, suppressed = _filter_unrouted_discord_targets(job, targets)
+        if suppressed:
+            job["_discord_alert_delivery_suppressed"] = True
+            logger.info(
+                "Job '%s': suppressed %d unrouted Discord delivery target(s)",
+                job.get("name", job.get("id", "?")),
+                suppressed,
+            )
+        if not targets:
+            job["_discord_alert_all_targets_suppressed"] = True
+            return None
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
@@ -1695,6 +1751,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
     except Exception:
         pass
+
+    # Opt-in Discord review alerts already use the strict happened/impact/action
+    # format. Never put the legacy Cronjob Response wrapper, job ID, separator,
+    # or management footer back around them.
+    if job.get("_discord_alert_metadata"):
+        wrap_response = False
 
     if wrap_response:
         task_name = job.get("name", job["id"])
@@ -1984,6 +2046,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
+
+            discord_alert_metadata = job.get("_discord_alert_metadata")
+            if platform_name.lower() == "discord" and isinstance(discord_alert_metadata, dict):
+                route_metadata.update(discord_alert_metadata)
+                if media_metadata is None:
+                    media_metadata = {}
+                media_metadata.update(discord_alert_metadata)
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
@@ -4726,6 +4795,56 @@ def run_one_job(
                 )
             else:
                 deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+
+            # Owner-configured Discord project review routes override the cron's
+            # broad/origin destination with exactly one review channel. The
+            # policy is opt-in; absent config returns None and preserves the
+            # historical job and content byte-for-byte.
+            from gateway.discord_alerts import (
+                load_discord_alert_policy,
+                prepare_cron_alert,
+                rollback_prepared_alert,
+            )
+
+            delivery_job = job
+            discord_alert_policy = load_discord_alert_policy()
+            prepared_discord_alert = None
+            if not (
+                success and _is_cron_silence_response(deliver_content)
+            ):
+                prepared_discord_alert = prepare_cron_alert(
+                    job,
+                    deliver_content,
+                    # An apparently successful empty turn is converted to failure
+                    # below. Route it as failure now so Discord never announces a
+                    # false recovery/review before that existing soft-failure guard.
+                    success=success and bool(final_response.strip()),
+                    error=(
+                        error
+                        or (
+                            "Agent completed but produced empty response"
+                            if success and not final_response.strip()
+                            else None
+                        )
+                    ),
+                    policy=discord_alert_policy,
+                )
+            if prepared_discord_alert is not None:
+                if prepared_discord_alert.content:
+                    delivery_job = dict(job)
+                    delivery_job["deliver"] = f"discord:{prepared_discord_alert.channel_id}"
+                    delivery_job["_discord_alert_metadata"] = dict(
+                        prepared_discord_alert.metadata
+                    )
+                    deliver_content = prepared_discord_alert.content
+                else:
+                    deliver_content = ""
+            elif discord_alert_policy.channels:
+                # Once the narrow alert policy is configured, generic cron
+                # successes and unclassified noise must not spill into a broad
+                # Discord home channel. Other platform targets remain intact.
+                delivery_job = dict(job)
+                delivery_job["_discord_alert_suppress_unrouted"] = True
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
@@ -4745,14 +4864,20 @@ def run_one_job(
 
             if should_deliver:
                 unresolved_origin = (
-                    _normalize_deliver_value(job.get("deliver", "local")) == "origin"
-                    and not _resolve_delivery_targets(job)
+                    _normalize_deliver_value(delivery_job.get("deliver", "local")) == "origin"
+                    and not _resolve_delivery_targets(delivery_job)
                 )
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    delivery_error = _deliver_result(
+                        delivery_job, deliver_content, adapters=adapters, loop=loop
+                    )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
+                if delivery_error and prepared_discord_alert is not None:
+                    rollback_prepared_alert(prepared_discord_alert)
+            elif prepared_discord_alert is not None:
+                rollback_prepared_alert(prepared_discord_alert)
         finally:
             # Tear down the deferred agent(s) now that save + delivery have run
             # (or raised). Must happen on every path so cron agents never leak
@@ -4775,9 +4900,13 @@ def run_one_job(
                 )
             else:
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
-        normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
+        normalized_deliver = _normalize_deliver_value(
+            delivery_job.get("deliver", "local")
+        )
         if delivery_error:
             delivery_outcome = "failed"
+        elif delivery_job.get("_discord_alert_all_targets_suppressed"):
+            delivery_outcome = "suppressed"
         elif should_deliver and unresolved_origin:
             delivery_outcome = "not_configured"
         elif should_deliver and normalized_deliver != "local":

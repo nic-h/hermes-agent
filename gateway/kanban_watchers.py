@@ -695,6 +695,19 @@ class GatewayKanbanWatchersMixin:
                         )
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+
+                        send_chat_id = sub["chat_id"]
+                        if platform_str == "discord":
+                            from gateway.discord_alerts import prepare_kanban_alert
+
+                            prepared_alert = prepare_kanban_alert(
+                                msg,
+                                metadata=metadata,
+                            )
+                            if prepared_alert is not None:
+                                send_chat_id = prepared_alert.channel_id
+                                msg = prepared_alert.content
+                                metadata = dict(prepared_alert.metadata)
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
@@ -724,7 +737,7 @@ class GatewayKanbanWatchersMixin:
                             continue
                         try:
                             _send_res = await adapter.send(
-                                sub["chat_id"], msg, metadata=metadata,
+                                send_chat_id, msg, metadata=metadata,
                             )
                             # A SendResult(success=False) without an exception
                             # (returned by push-capable adapters on a genuine
@@ -764,7 +777,7 @@ class GatewayKanbanWatchersMixin:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,
-                                        chat_id=sub["chat_id"],
+                                        chat_id=send_chat_id,
                                         metadata=metadata,
                                         event_payload=getattr(ev, "payload", None),
                                         task=task,

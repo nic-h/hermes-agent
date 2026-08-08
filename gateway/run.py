@@ -7560,6 +7560,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             error_code=adapter.fatal_error_code,
             error_message=adapter.fatal_error_message,
         )
+        await self._send_discord_system_alert(
+            "degraded",
+            detail=f"{adapter.platform.value} delivery",
+            failure_key=f"platform:{adapter.platform.value}",
+        )
 
         if existing is adapter:
             # Claim this adapter for teardown before awaiting disconnect() —
@@ -8273,6 +8278,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             pass
+
+    async def _send_discord_system_alert(
+        self,
+        state: str,
+        *,
+        detail: str = "",
+        failure_key: str = "gateway",
+    ) -> bool:
+        """Best-effort delivery to the opt-in Discord status channel."""
+        from gateway.discord_alerts import (
+            prepare_gateway_alert,
+            rollback_prepared_alert,
+        )
+
+        prepared = prepare_gateway_alert(
+            state,
+            detail=detail,
+            failure_key=failure_key,
+        )
+        if prepared is None or not prepared.content:
+            return False
+        adapter = getattr(self, "adapters", {}).get(Platform.DISCORD)
+        if adapter is None:
+            rollback_prepared_alert(prepared)
+            return False
+        try:
+            result = await adapter.send(
+                prepared.channel_id,
+                prepared.content,
+                metadata=dict(prepared.metadata),
+            )
+            delivered = not (
+                result is not None and getattr(result, "success", True) is False
+            )
+            if not delivered:
+                rollback_prepared_alert(prepared)
+            return delivered
+        except Exception:
+            rollback_prepared_alert(prepared)
+            logger.debug("Discord system alert delivery failed", exc_info=True)
+            return False
 
     # ------------------------------------------------------------------
     # Per-platform circuit breaker (pause/resume) — used by the reconnect
@@ -9713,6 +9759,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         msg = f"⚠️ Gateway {action} — {hint}"
 
+        from gateway.discord_alerts import load_discord_alert_policy
+
+        discord_status_channel = load_discord_alert_policy().channel_for("gateway")
+        if discord_status_channel:
+            await self._send_discord_system_alert(
+                "restarting" if self._restart_requested else "shutdown"
+            )
+
         notified: set[tuple[str, str, Optional[str]]] = set()
         for session_key in active:
             source = None
@@ -9754,6 +9808,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             try:
                 platform = Platform(platform_str)
+                if platform == Platform.DISCORD and discord_status_channel:
+                    continue
                 adapter = self.adapters.get(platform)
                 if not adapter:
                     continue
@@ -9843,6 +9899,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
         for platform, adapter in list(self.adapters.items()):
+            if platform == Platform.DISCORD and discord_status_channel:
+                continue
             home = self.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue
@@ -11933,6 +11991,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             finally:
                 _clear_planned_restart_notification()
+        elif not chat_restart_notification_pending:
+            # The opt-in Discord status channel is a service-health surface,
+            # not merely a /restart reply target. Announce ordinary cold starts
+            # there as well; absent policy this is a no-op.
+            await self._send_discord_system_alert("online")
 
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
@@ -13047,6 +13110,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             needs_attention=False,
                             retrying_since=None,
                         )
+                        await self._send_discord_system_alert(
+                            "recovered",
+                            detail=f"{platform.value} delivery",
+                            failure_key=f"platform:{platform.value}",
+                        )
                         logger.info("✓ %s reconnected successfully", platform.value)
 
                         # Rebuild channel directory with the new adapter
@@ -13099,6 +13167,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             error_code=adapter.fatal_error_code,
                             error_message=adapter.fatal_error_message or "failed to reconnect",
                         )
+                        await self._send_discord_system_alert(
+                            "degraded",
+                            detail=f"{platform.value} delivery",
+                            failure_key=f"platform:{platform.value}",
+                        )
                         backoff = _reconnect_backoff(attempt)
                         info["attempts"] = attempt
                         info["next_retry"] = time.monotonic() + backoff
@@ -13136,6 +13209,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         platform_state="retrying",
                         error_code=None,
                         error_message=str(e),
+                    )
+                    await self._send_discord_system_alert(
+                        "degraded",
+                        detail=f"{platform.value} delivery",
+                        failure_key=f"platform:{platform.value}",
                     )
                     backoff = _reconnect_backoff(attempt)
                     info["attempts"] = attempt
@@ -22491,6 +22569,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reply_to_message_id=message_id,
                 adapter=transport.adapter,
             )
+            message = "♻ Gateway restarted successfully. Your session continues."
+            status_channel: Optional[str] = None
+            if platform == Platform.DISCORD:
+                from gateway.discord_alerts import (
+                    discord_alert_metadata,
+                    format_gateway_alert,
+                    load_discord_alert_policy,
+                )
+
+                status_channel = load_discord_alert_policy().channel_for("gateway")
+                if status_channel and self.adapters.get(Platform.DISCORD) is not None:
+                    chat_id = status_channel
+                    thread_id = None
+                    metadata = discord_alert_metadata()
+                    message = format_gateway_alert("online")
             if data.get("delivered_via_upstream_relay") is True:
                 metadata = dict(metadata or {})
                 if data.get("user_id"):
@@ -22500,7 +22593,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             result = await transport.send(
                 platform,
                 str(chat_id),
-                "♻ Gateway restarted successfully. Your session continues.",
+                message,
                 metadata=_non_conversational_metadata(metadata, platform=platform),
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")
@@ -22521,6 +22614,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 platform_str,
                 chat_id,
             )
+            if platform != Platform.DISCORD:
+                await self._send_discord_system_alert("online")
             return str(platform_str), str(chat_id), str(thread_id) if thread_id else None
         except Exception as e:
             logger.warning("Restart notification failed: %s", e)
@@ -22543,7 +22638,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         skipped = skip_targets or set()
         message = "♻️ Gateway online — Hermes is back and ready."
 
+        from gateway.discord_alerts import load_discord_alert_policy
+
+        discord_status_channel = load_discord_alert_policy().channel_for("gateway")
+        if discord_status_channel:
+            if await self._send_discord_system_alert("online"):
+                delivered.add(("discord", discord_status_channel, None))
+
         for platform, platform_cfg in self.config.platforms.items():
+            if platform == Platform.DISCORD and discord_status_channel:
+                continue
             home = platform_cfg.home_channel
             if not home or not home.chat_id:
                 continue

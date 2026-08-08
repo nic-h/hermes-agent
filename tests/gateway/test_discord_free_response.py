@@ -710,6 +710,41 @@ async def test_discord_send_does_not_cache_nonconversational_status_as_history_b
 
 
 @pytest.mark.asyncio
+async def test_discord_alert_send_disables_all_mentions(adapter, monkeypatch):
+    """Automated alert text can never ping users, roles, or everyone."""
+    mention_policy = object()
+    monkeypatch.setattr(
+        "plugins.platforms.discord.adapter._build_no_mentions",
+        lambda: mention_policy,
+    )
+    sent = {}
+
+    class SendingChannel(FakeTextChannel):
+        async def send(self, **kwargs):
+            sent.update(kwargs)
+            return SimpleNamespace(id=223)
+
+    channel = SendingChannel(channel_id=778)
+    adapter._client = SimpleNamespace(
+        user=adapter._client.user,
+        get_channel=lambda channel_id: channel if channel_id == 778 else None,
+        fetch_channel=AsyncMock(return_value=channel),
+    )
+
+    result = await adapter.send(
+        "778",
+        "What happened: @everyone review is ready.",
+        metadata={
+            "non_conversational": True,
+            "discord_no_mentions": True,
+        },
+    )
+
+    assert result.success is True
+    assert sent["allowed_mentions"] is mention_policy
+
+
+@pytest.mark.asyncio
 async def test_discord_shared_channel_backfill_prepends_context(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)

@@ -129,6 +129,54 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
     assert adapter.handled[0].source.thread_id == "20197"
 
 
+def test_discord_kanban_notification_routes_only_to_configured_update_channel(
+    tmp_path, monkeypatch,
+):
+    from gateway.discord_alerts import DiscordAlertPolicy
+    import gateway.discord_alerts as discord_alerts
+
+    db_path = tmp_path / "discord-kanban-route.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="Discord route", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="1535574257927716894",
+            thread_id="987654321098765432",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    policy = DiscordAlertPolicy.from_config(
+        {
+            "gateway": {
+                "discord_alerts": {
+                    "channels": {"kanban": "1535573028459773993"},
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(discord_alerts, "load_discord_alert_policy", lambda: policy)
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.__dict__["adapters"] = {Platform.DISCORD: adapter}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "1535573028459773993"
+    assert adapter.sent[0]["text"].startswith("What happened: DONE:")
+    assert adapter.sent[0]["metadata"] == {
+        "non_conversational": True,
+        "discord_no_mentions": True,
+    }
+
+
 def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     """A sub stamped with the gateway's own named profile uses self.adapters.
 

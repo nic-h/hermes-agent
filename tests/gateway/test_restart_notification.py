@@ -32,6 +32,81 @@ def test_planned_restart_notification_pending_roundtrip(tmp_path, monkeypatch):
     assert gateway_run._planned_restart_notification_pending() is False
 
 
+@pytest.mark.asyncio
+async def test_discord_startup_alert_uses_status_channel_not_home_channel(monkeypatch):
+    from gateway.discord_alerts import DiscordAlertPolicy
+    import gateway.discord_alerts as discord_alerts
+
+    status_channel = "1535573027369123970"
+    broad_home = "1492750576415412404"
+    policy = DiscordAlertPolicy.from_config(
+        {
+            "gateway": {
+                "discord_alerts": {
+                    "channels": {"status": status_channel},
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(discord_alerts, "load_discord_alert_policy", lambda: policy)
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.DISCORD] = PlatformConfig(
+        enabled=True,
+        token="***",
+        home_channel=HomeChannel(
+            platform=Platform.DISCORD,
+            chat_id=broad_home,
+            name="broad-home",
+        ),
+    )
+    runner.__dict__["adapters"] = {Platform.DISCORD: adapter}
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == {("discord", status_channel, None)}
+    sent_calls = getattr(adapter, "sent_calls")
+    assert len(sent_calls) == 1
+    chat_id, content, metadata = sent_calls[0]
+    assert chat_id == status_channel
+    assert "What happened: Hermes Gateway is online." in content
+    assert metadata == {
+        "non_conversational": True,
+        "discord_no_mentions": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_failed_discord_status_send_does_not_consume_failure_cooldown(monkeypatch):
+    from gateway.discord_alerts import DiscordAlertPolicy
+    import gateway.discord_alerts as discord_alerts
+
+    policy = DiscordAlertPolicy.from_config(
+        {
+            "gateway": {
+                "discord_alerts": {
+                    "channels": {"status": "1535573027369123970"},
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(discord_alerts, "load_discord_alert_policy", lambda: policy)
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(
+        return_value=SendResult(success=False, error="transport unavailable")
+    )
+    runner.__dict__["adapters"] = {Platform.DISCORD: adapter}
+
+    for _ in range(2):
+        assert await runner._send_discord_system_alert(
+            "degraded",
+            detail="telegram delivery",
+            failure_key="platform:telegram-rollback-test",
+        ) is False
+
+    assert adapter.send.await_count == 2
+
+
 # ── _handle_restart_command writes .restart_notify.json ──────────────────
 
 

@@ -548,6 +548,14 @@ def _build_allowed_mentions():
     )
 
 
+def _build_no_mentions():
+    """Build a per-send mention deny-list for automated alert messages."""
+    allowed_mentions_cls = getattr(discord, "AllowedMentions", None)
+    if allowed_mentions_cls is None:
+        return None
+    return allowed_mentions_cls.none()
+
+
 def _discord_ready_timeout_seconds() -> float:
     """Return the Discord ready wait timeout during gateway startup."""
     raw = os.getenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "").strip()
@@ -3463,7 +3471,13 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
-                result = await self._send_to_forum(channel, content)
+                result = await self._send_to_forum(
+                    channel,
+                    content,
+                    no_mentions=bool(
+                        metadata and metadata.get("discord_no_mentions")
+                    ),
+                )
                 await asyncio.to_thread(
                     self._record_discord_response,
                     reply_to=reply_to,
@@ -3480,17 +3494,22 @@ class DiscordAdapter(BasePlatformAdapter):
             message_ids = []
             # Build the reference from ids — no fetch_message round trip.
             reference = self._reply_reference_for_send(reply_to, channel)
+            no_mentions = bool(metadata and metadata.get("discord_no_mentions"))
+            allowed_mentions = _build_no_mentions() if no_mentions else None
 
             for i, chunk in enumerate(chunks):
                 if self._reply_to_mode == "all":
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                send_kwargs: Dict[str, Any] = {
+                    "content": chunk,
+                    "reference": chunk_reference,
+                }
+                if allowed_mentions is not None:
+                    send_kwargs["allowed_mentions"] = allowed_mentions
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -3509,10 +3528,8 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        send_kwargs["reference"] = None
+                        msg = await channel.send(**send_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -3552,7 +3569,13 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return result
 
-    async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+    async def _send_to_forum(
+        self,
+        forum_channel: Any,
+        content: str,
+        *,
+        no_mentions: bool = False,
+    ) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
         Forum channels (type 15) don't support direct messages.  Instead we
@@ -3570,17 +3593,25 @@ class DiscordAdapter(BasePlatformAdapter):
         thread_name = _derive_forum_thread_name(content)
 
         starter_content = chunks[0] if chunks else thread_name
+        send_kwargs: Dict[str, Any] = {
+            "name": thread_name,
+            "content": starter_content,
+        }
+        if no_mentions:
+            send_kwargs["allowed_mentions"] = _build_no_mentions()
 
         try:
-            thread = await forum_channel.create_thread(
-                name=thread_name,
-                content=starter_content,
-            )
+            thread = await forum_channel.create_thread(**send_kwargs)
         except Exception as e:
             logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
             return SendResult(success=False, error=f"Forum thread creation failed: {e}")
 
         thread_channel = thread if hasattr(thread, "send") else getattr(thread, "thread", None)
+        if thread_channel is None:
+            return SendResult(
+                success=False,
+                error="Forum thread response had no sendable channel",
+            )
         thread_id = str(getattr(thread_channel, "id", getattr(thread, "id", "")))
         starter_msg = getattr(thread, "message", None)
         message_id = str(getattr(starter_msg, "id", thread_id)) if starter_msg else thread_id
@@ -3591,7 +3622,10 @@ class DiscordAdapter(BasePlatformAdapter):
         warnings: list[str] = []
         for chunk in chunks[1:]:
             try:
-                msg = await thread_channel.send(content=chunk)
+                followup_kwargs: Dict[str, Any] = {"content": chunk}
+                if no_mentions:
+                    followup_kwargs["allowed_mentions"] = _build_no_mentions()
+                msg = await thread_channel.send(**followup_kwargs)
                 message_ids.append(str(msg.id))
             except Exception as e:
                 warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"
