@@ -22647,6 +22647,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         for platform, platform_cfg in self.config.platforms.items():
             if platform == Platform.DISCORD and discord_status_channel:
+                logger.info(
+                    "Discord home-channel startup notification relocated to "
+                    "configured gateway alert channel %s",
+                    discord_status_channel,
+                )
                 continue
             home = platform_cfg.home_channel
             if not home or not home.chat_id:
@@ -23978,7 +23983,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "honcho.runtime_peer_prefix",
         "honcho.user_peer_aliases",
     )
-    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
+    _HONCHO_CACHE_BUSTING_MEMO: dict[
+        tuple[str, int | None, int | None, int | None], dict[str, Any]
+    ] = {}
 
     @classmethod
     def _empty_honcho_cache_busting_config(cls) -> dict[str, Any]:
@@ -23992,10 +23999,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             path = resolve_config_path()
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                stat = path.stat()
+                mtime_ns = stat.st_mtime_ns
+                ctime_ns = stat.st_ctime_ns
+                size = stat.st_size
             except OSError:
                 mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                ctime_ns = None
+                size = None
+            # Some filesystems preserve/coarsen mtime across rapid rewrites.
+            # ctime + size keep live Honcho identity edits from reusing a stale
+            # agent-cache signature while retaining the no-reparse fast path.
+            memo_key = (str(path), mtime_ns, ctime_ns, size)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)

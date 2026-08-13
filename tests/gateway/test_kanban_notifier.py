@@ -443,6 +443,53 @@ def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     assert ":group:" not in wake_key
 
 
+def test_review_requested_notifies_wakes_and_advances_cursor(tmp_path, monkeypatch):
+    """Review handoff is visible once and wakes the task's origin session."""
+    db_path = tmp_path / "review-requested.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="review this",
+            assignee="reviewer",
+            session_id="origin-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-dm",
+            chat_type="dm",
+        )
+        kb._append_event(
+            conn,
+            tid,
+            "review_requested",
+            {"summary": "implementation ready"},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "ready for review" in adapter.sent[0]["text"]
+    assert "implementation ready" in adapter.sent[0]["text"]
+    assert len(adapter.handled) == 1
+    assert "ready for review" in adapter.handled[0].text
+
+    # Cursor advancement makes the delivery exactly-once.
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+
+
 def _unseen_terminal_events_for(tid, chat_id):
     conn = kb.connect()
     try:

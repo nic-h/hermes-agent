@@ -450,6 +450,41 @@ def test_crash_reap_terminates_orphaned_worker_descendant(kanban_home, monkeypat
             pass
 
 
+def test_crash_reap_terminates_outside_write_transaction(kanban_home, monkeypatch):
+    """Slow process-tree cleanup must never hold the board's writer lock."""
+    import hermes_cli.kanban_db as _kb
+
+    with _kb.connect() as conn:
+        tid = _kb.create_task(conn, title="dead worker", assignee="worker")
+        claimed = _kb.claim_task(conn, tid)
+        assert claimed is not None
+        _kb._set_worker_pid(conn, tid, 987654)
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+        def _terminate(pid, claim_lock, **kwargs):
+            assert not conn.in_transaction
+            assert pid == 987654
+            assert claim_lock
+            return {
+                "prev_pid": pid,
+                "host_local": True,
+                "termination_attempted": True,
+                "terminated": True,
+                "sigkill": False,
+                "process_group": None,
+                "process_groups": [],
+                "signaled_process_group": False,
+            }
+
+        monkeypatch.setattr(_kb, "_terminate_reclaimed_worker", _terminate)
+
+        assert _kb.detect_crashed_workers(conn) == [tid]
+        task = _kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+
+
 def test_dispatch_result_reports_genuine_spawn_failure(
     kanban_home, all_assignees_spawnable,
 ):

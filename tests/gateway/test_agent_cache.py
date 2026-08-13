@@ -175,10 +175,10 @@ class TestExtractCacheBustingConfig:
 
         assert out["tools.registry_generation"] == 12345
 
-    def test_honcho_cache_busting_config_memoized_by_mtime(
+    def test_honcho_cache_busting_config_memoized_by_file_identity(
         self, monkeypatch, tmp_path,
     ):
-        """Unchanged honcho.json reuses the parse result; an mtime edit does not."""
+        """Unchanged honcho.json is memoized; timestamp or size edits reparse."""
         from types import SimpleNamespace
 
         from gateway.run import GatewayRunner
@@ -222,6 +222,17 @@ class TestExtractCacheBustingConfig:
 
         assert third == first
         assert parse_calls == [config_path, config_path]
+
+        # A rapid rewrite can preserve mtime on coarse or explicitly-restored
+        # filesystems. The widened identity must still observe the size/ctime
+        # change and rebuild the agent-cache signature.
+        same_mtime_ns = config_path.stat().st_mtime_ns
+        config_path.write_text('{"changed": true, "larger": true}')
+        os.utime(config_path, ns=(same_mtime_ns, same_mtime_ns))
+        fourth = GatewayRunner._extract_honcho_cache_busting_config()
+
+        assert fourth == first
+        assert parse_calls == [config_path, config_path, config_path]
 
 
 class TestAgentCacheLifecycle:

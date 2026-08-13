@@ -1,6 +1,7 @@
 """Tests for /restart notification — the gateway notifies the requester on comeback."""
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -33,7 +34,9 @@ def test_planned_restart_notification_pending_roundtrip(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_discord_startup_alert_uses_status_channel_not_home_channel(monkeypatch):
+async def test_discord_startup_alert_uses_status_channel_not_home_channel(
+    monkeypatch, caplog,
+):
     from gateway.discord_alerts import DiscordAlertPolicy
     import gateway.discord_alerts as discord_alerts
 
@@ -49,6 +52,7 @@ async def test_discord_startup_alert_uses_status_channel_not_home_channel(monkey
         }
     )
     monkeypatch.setattr(discord_alerts, "load_discord_alert_policy", lambda: policy)
+    caplog.set_level(logging.INFO, logger="gateway.run")
 
     runner, adapter = make_restart_runner()
     runner.config.platforms[Platform.DISCORD] = PlatformConfig(
@@ -74,6 +78,7 @@ async def test_discord_startup_alert_uses_status_channel_not_home_channel(monkey
         "non_conversational": True,
         "discord_no_mentions": True,
     }
+    assert "home-channel startup notification relocated" in caplog.text
 
 
 @pytest.mark.asyncio

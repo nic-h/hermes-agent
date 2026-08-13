@@ -7931,7 +7931,7 @@ def _process_group_alive(pgid: int) -> bool:
             pass
 
     try:
-        os.killpg(int(pgid), 0)
+        os.killpg(int(pgid), 0)  # windows-footgun: ok -- POSIX guard above
         return True
     except ProcessLookupError:
         return False
@@ -8079,7 +8079,7 @@ def _terminate_reclaimed_worker(
             delivered = False
             for pgid in pgids:
                 try:
-                    os.killpg(pgid, sig)
+                    os.killpg(pgid, sig)  # windows-footgun: ok -- POSIX-only PGIDs
                     delivered = True
                 except ProcessLookupError:
                     continue
@@ -8696,107 +8696,99 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
-    # Per-crash details collected inside the main txn, used after it
-    # closes to run ``_record_task_failure`` (which needs its own
+    # Per-crash details collected inside the short per-task write txns, used after
+    # each closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
-    with write_txn(conn):
-        rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
-        ).fetchall()
-        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-        for row in rows:
-            # Only check liveness for claims owned by this host.
-            lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
+    rows = conn.execute(
+        "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+        "WHERE status = 'running' AND worker_pid IS NOT NULL"
+    ).fetchall()
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    for row in rows:
+        # Only check liveness for claims owned by this host.
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        # Skip liveness check inside the launch-window grace period
+        # so a freshly-spawned worker isn't reclaimed before its PID
+        # is visible on /proc.
+        started_at = row["started_at"] if "started_at" in row.keys() else None
+        if started_at is not None:
+            grace = _resolve_crash_grace_seconds()
+            if time.time() - started_at < grace:
                 continue
-            # Skip liveness check inside the launch-window grace period
-            # so a freshly-spawned worker isn't reclaimed before its PID
-            # is visible on /proc.
-            started_at = row["started_at"] if "started_at" in row.keys() else None
-            if started_at is not None:
-                grace = _resolve_crash_grace_seconds()
-                if time.time() - started_at < grace:
-                    continue
-            if _pid_alive(row["worker_pid"]):
-                continue
+        if _pid_alive(row["worker_pid"]):
+            continue
 
-            pid = int(row["worker_pid"])
-            # The worker leader is dead, but terminal/tool descendants can
-            # still be alive in the isolated session created by _default_spawn.
-            # Reap those task-owned process groups before releasing the claim.
-            termination = _terminate_reclaimed_worker(
-                pid, row["claim_lock"], task_id=row["id"],
+        pid = int(row["worker_pid"])
+        kind, code = _classify_worker_exit(pid)
+        # Process-tree discovery, SIGTERM/SIGKILL grace waits, and liveness
+        # probes can take seconds. They must happen before BEGIN IMMEDIATE so
+        # one crashed worker never stalls every writer on the shared board.
+        termination = _terminate_reclaimed_worker(
+            pid, row["claim_lock"], task_id=row["id"],
+        )
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, row["id"], row["claim_lock"], int(time.time()), termination,
+                reason="crashed_worker_descendant_alive",
             )
-            kind, code = _classify_worker_exit(pid)
-            rate_limited_exit = False
-            if kind == "clean_exit":
-                # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
-                # work itself succeeded and only the paperwork was skipped, so
-                # a retry usually completes; the corrective sentence below is
-                # surfaced to the retry worker via the prior-attempt error in
-                # ``build_worker_context`` (guidance approach from #61817).
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
-                )
-                event_kind = "protocol_violation"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                    # Durable marker for _protocol_violation_streak: _end_run
-                    # copies this payload into the run metadata, which is how
-                    # the violation-only retry budget is derived later.
-                    "protocol_violation": True,
-                }
-            elif kind == "rate_limited":
-                # Worker bailed because the provider rate-limited / exhausted
-                # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
-                # the task is fine, the account just hit a wall. Release it
-                # back to its source phase so the respawn guard defers it until the
-                # quota window clears, and crucially do NOT count a failure
-                # (skip ``_record_task_failure``) so a long quota window can't
-                # trip the circuit breaker and permanently block the card.
-                protocol_violation = False
-                rate_limited_exit = True
-                error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
-                    f"requeued without counting a failure"
-                )
-                event_kind = "rate_limited"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                }
-            else:
-                protocol_violation = False
-                if kind == "nonzero_exit":
-                    error_text = f"pid {pid} exited with code {code}"
-                elif kind == "signaled":
-                    error_text = f"pid {pid} killed by signal {code}"
-                else:
-                    error_text = f"pid {pid} not alive"
-                event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
-                    event_payload["exit_code"] = code
-            event_payload.update(termination)
+            continue
 
+        rate_limited_exit = False
+        if kind == "clean_exit":
+            protocol_violation = True
+            error_text = (
+                "worker exited cleanly (rc=0) without calling "
+                "kanban_complete or kanban_block — protocol violation. "
+                "If the prior run already did the work, verify it and "
+                "report the result via kanban_complete; a run that ends "
+                "without a terminal kanban call counts as failed no "
+                "matter what it did."
+            )
+            event_kind = "protocol_violation"
+            event_payload = {
+                "pid": pid,
+                "claimer": row["claim_lock"],
+                "exit_code": code,
+                "protocol_violation": True,
+            }
+        elif kind == "rate_limited":
+            protocol_violation = False
+            rate_limited_exit = True
+            error_text = (
+                f"pid {pid} exited rate-limited (quota wall) — "
+                f"requeued without counting a failure"
+            )
+            event_kind = "rate_limited"
+            event_payload = {
+                "pid": pid,
+                "claimer": row["claim_lock"],
+                "exit_code": code,
+            }
+        else:
+            protocol_violation = False
+            if kind == "nonzero_exit":
+                error_text = f"pid {pid} exited with code {code}"
+            elif kind == "signaled":
+                error_text = f"pid {pid} killed by signal {code}"
+            else:
+                error_text = f"pid {pid} not alive"
+            event_kind = "crashed"
+            event_payload = {"pid": pid, "claimer": row["claim_lock"]}
+            if code is not None and kind != "unknown":
+                event_payload["exit_kind"] = kind
+                event_payload["exit_code"] = code
+        event_payload.update(termination)
+
+        # Re-enter a short transaction and CAS the exact dead attempt. Another
+        # recovery path may have changed the row while termination ran.
+        with write_txn(conn):
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
             cur = conn.execute(
