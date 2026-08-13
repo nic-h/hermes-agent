@@ -3650,6 +3650,7 @@ class DiscordAdapter(BasePlatformAdapter):
         content: str = "",
         file: Any = None,
         files: Optional[list] = None,
+        no_mentions: bool = False,
     ) -> SendResult:
         """Create a forum thread whose starter message carries file attachments.
 
@@ -3679,6 +3680,8 @@ class DiscordAdapter(BasePlatformAdapter):
             kwargs["file"] = file
         if files:
             kwargs["files"] = files
+        if no_mentions:
+            kwargs["allowed_mentions"] = _build_no_mentions()
 
         try:
             thread = await forum_channel.create_thread(**kwargs)
@@ -3956,6 +3959,7 @@ class DiscordAdapter(BasePlatformAdapter):
         file_path: str,
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
+        no_mentions: bool = False,
     ) -> SendResult:
         """Send a local file as a Discord attachment.
 
@@ -3998,12 +4002,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 channel,
                 content=(caption or "").strip(),
                 files=[discord_file],
+                no_mentions=no_mentions,
             )
             return result
-        msg = await channel.send(
-            content=caption if caption else None,
-            files=[discord_file],
-        )
+        send_kwargs: Dict[str, Any] = {
+            "content": caption if caption else None,
+            "files": [discord_file],
+        }
+        if no_mentions:
+            send_kwargs["allowed_mentions"] = _build_no_mentions()
+        msg = await channel.send(**send_kwargs)
         attachments = getattr(msg, "attachments", None) or []
         if not attachments:
             # Discord accepted the message but attached nothing — the failure
@@ -4066,6 +4074,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         CHUNK = 10
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
+        no_mentions = bool(metadata and metadata.get("discord_no_mentions"))
 
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
@@ -4136,9 +4145,16 @@ class DiscordAdapter(BasePlatformAdapter):
                         channel,
                         content=(content or "").strip(),
                         files=files,
+                        no_mentions=no_mentions,
                     )
                 else:
-                    await channel.send(content=content, files=files)
+                    send_kwargs: Dict[str, Any] = {
+                        "content": content,
+                        "files": files,
+                    }
+                    if no_mentions:
+                        send_kwargs["allowed_mentions"] = _build_no_mentions()
+                    await channel.send(**send_kwargs)
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
@@ -4184,6 +4200,8 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             import io
 
+            no_mentions = bool(metadata and metadata.get("discord_no_mentions"))
+
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
@@ -4211,6 +4229,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     channel,
                     content=(caption or "").strip(),
                     file=forum_file,
+                    no_mentions=no_mentions,
                 )
 
             # Try sending as a native voice message via raw API (flags=8192).
@@ -4243,6 +4262,10 @@ class DiscordAdapter(BasePlatformAdapter):
                         "message_id": str(reply_to),
                         "fail_if_not_exists": False,
                     }
+                if no_mentions:
+                    allowed_mentions = _build_no_mentions()
+                    if allowed_mentions is not None:
+                        payload_data["allowed_mentions"] = allowed_mentions.to_dict()
                 payload = _json.dumps(payload_data)
                 form = [
                     {"name": "payload_json", "value": payload},
@@ -4261,8 +4284,14 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as voice_err:
                 logger.debug("Voice message flag failed, falling back to file: %s", voice_err)
                 file = discord.File(io.BytesIO(file_data), filename=filename)
+                send_kwargs: Dict[str, Any] = {
+                    "file": file,
+                    "reference": reference,
+                }
+                if no_mentions:
+                    send_kwargs["allowed_mentions"] = _build_no_mentions()
                 try:
-                    msg = await channel.send(file=file, reference=reference)
+                    msg = await channel.send(**send_kwargs)
                 except Exception as send_err:
                     err_text = str(send_err)
                     if (
@@ -4275,7 +4304,8 @@ class DiscordAdapter(BasePlatformAdapter):
                             or "error code: 10008" in err_text
                         )
                     ):
-                        msg = await channel.send(file=file, reference=None)
+                        send_kwargs["reference"] = None
+                        msg = await channel.send(**send_kwargs)
                     else:
                         raise
                 return SendResult(success=True, message_id=str(msg.id))
@@ -5379,7 +5409,12 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a local image file natively as a Discord file attachment."""
         try:
-            return await self._send_file_attachment(chat_id, image_path, caption)
+            return await self._send_file_attachment(
+                chat_id,
+                image_path,
+                caption,
+                no_mentions=bool(metadata and metadata.get("discord_no_mentions")),
+            )
         except FileNotFoundError:
             return SendResult(success=False, error=f"Image file not found: {image_path}")
         except Exception as e:  # pragma: no cover - defensive logging
@@ -5404,6 +5439,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         try:
             import aiohttp
+            no_mentions = bool(metadata and metadata.get("discord_no_mentions"))
 
             channel = self._client.get_channel(int(chat_id))
             if not channel:
@@ -5444,12 +5480,16 @@ class DiscordAdapter(BasePlatformAdapter):
                         channel,
                         content=(caption or "").strip(),
                         file=file,
+                        no_mentions=no_mentions,
                     )
 
-                msg = await channel.send(
-                    content=caption if caption else None,
-                    file=file,
-                )
+                send_kwargs: Dict[str, Any] = {
+                    "content": caption if caption else None,
+                    "file": file,
+                }
+                if no_mentions:
+                    send_kwargs["allowed_mentions"] = _build_no_mentions()
+                msg = await channel.send(**send_kwargs)
                 return SendResult(success=True, message_id=str(msg.id))
 
         except ImportError:
@@ -5458,7 +5498,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 self.name,
                 exc_info=True,
             )
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(
+                chat_id, image_url, caption, reply_to, metadata=metadata
+            )
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error(
                 "[%s] Failed to send image attachment, falling back to URL: %s",
@@ -5466,7 +5508,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 e,
                 exc_info=True,
             )
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(
+                chat_id, image_url, caption, reply_to, metadata=metadata
+            )
 
     async def send_animation(
         self,
@@ -5486,6 +5530,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         try:
             import aiohttp
+            no_mentions = bool(metadata and metadata.get("discord_no_mentions"))
 
             channel = self._client.get_channel(int(chat_id))
             if not channel:
@@ -5516,12 +5561,16 @@ class DiscordAdapter(BasePlatformAdapter):
                         channel,
                         content=(caption or "").strip(),
                         file=file,
+                        no_mentions=no_mentions,
                     )
 
-                msg = await channel.send(
-                    content=caption if caption else None,
-                    file=file,
-                )
+                send_kwargs: Dict[str, Any] = {
+                    "content": caption if caption else None,
+                    "file": file,
+                }
+                if no_mentions:
+                    send_kwargs["allowed_mentions"] = _build_no_mentions()
+                msg = await channel.send(**send_kwargs)
                 return SendResult(success=True, message_id=str(msg.id))
 
         except ImportError:
@@ -5550,7 +5599,12 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a local video file natively as a Discord attachment."""
         try:
-            return await self._send_file_attachment(chat_id, video_path, caption)
+            return await self._send_file_attachment(
+                chat_id,
+                video_path,
+                caption,
+                no_mentions=bool(metadata and metadata.get("discord_no_mentions")),
+            )
         except FileNotFoundError:
             return SendResult(success=False, error=f"Video file not found: {video_path}")
         except Exception as e:  # pragma: no cover - defensive logging
@@ -5568,7 +5622,13 @@ class DiscordAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an arbitrary file natively as a Discord attachment."""
         try:
-            return await self._send_file_attachment(chat_id, file_path, caption, file_name=file_name)
+            return await self._send_file_attachment(
+                chat_id,
+                file_path,
+                caption,
+                file_name=file_name,
+                no_mentions=bool(metadata and metadata.get("discord_no_mentions")),
+            )
         except FileNotFoundError:
             return SendResult(success=False, error=f"File not found: {file_path}")
         except Exception as e:  # pragma: no cover - defensive logging

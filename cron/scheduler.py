@@ -1657,10 +1657,13 @@ def _filter_unrouted_discord_targets(
     deliver = _normalize_deliver_value(job.get("deliver", "local"))
     explicit: set[tuple[str, str, Optional[str]]] = set()
     for part in (value.strip() for value in deliver.split(",")):
-        if not part.casefold().startswith("discord:"):
+        if not part or part.casefold() in _ROUTING_TOKENS:
             continue
         resolved = _resolve_single_delivery_target(job, part)
-        if resolved is not None:
+        if (
+            resolved is not None
+            and str(resolved.get("platform") or "").casefold() == "discord"
+        ):
             explicit.add(
                 (
                     "discord",
@@ -1755,7 +1758,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # Opt-in Discord review alerts already use the strict happened/impact/action
     # format. Never put the legacy Cronjob Response wrapper, job ID, separator,
     # or management footer back around them.
-    if job.get("_discord_alert_metadata"):
+    if (
+        job.get("_discord_alert_metadata")
+        and not job.get("_discord_alert_channel_id")
+    ):
         wrap_response = False
 
     if wrap_response:
@@ -1802,6 +1808,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        is_discord_alert_target = (
+            platform_name.casefold() == "discord"
+            and str(chat_id) == str(job.get("_discord_alert_channel_id") or "")
+            and bool(job.get("_discord_alert_content"))
+        )
+        target_cleaned_delivery_content = cleaned_delivery_content
+        target_media_files = media_files
+        if is_discord_alert_target:
+            target_media_files, target_cleaned_delivery_content = (
+                BasePlatformAdapter.extract_media(str(job["_discord_alert_content"]))
+            )
+            target_media_files = BasePlatformAdapter.filter_media_delivery_paths(
+                target_media_files
+            )
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -2048,7 +2068,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
             discord_alert_metadata = job.get("_discord_alert_metadata")
-            if platform_name.lower() == "discord" and isinstance(discord_alert_metadata, dict):
+            if is_discord_alert_target and isinstance(discord_alert_metadata, dict):
                 route_metadata.update(discord_alert_metadata)
                 if media_metadata is None:
                     media_metadata = {}
@@ -2062,7 +2082,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                text_to_send = target_cleaned_delivery_content.strip()
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
@@ -2211,7 +2231,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # payload is already assumed delivered (#38922).  Record the
                 # skipped attachments so the drop is visible rather than silently
                 # lost.
-                if adapter_ok and not timed_out and media_files:
+                if adapter_ok and not timed_out and target_media_files:
                     routed_media_metadata = dict(media_metadata or {})
                     if transport is not None and transport.is_relay:
                         routed_media_metadata["_relay_logical_platform"] = platform.value
@@ -2224,15 +2244,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
-                        media_files,
+                        target_media_files,
                         routed_media_metadata or None,
                         loop,
                         job,
                         platform=platform,
                     )
-                elif timed_out and media_files:
+                elif timed_out and target_media_files:
                     msg = (
-                        f"{len(media_files)} media attachment(s) not delivered to "
+                        f"{len(target_media_files)} media attachment(s) not delivered to "
                         f"{platform_name}:{chat_id} (live adapter confirmation timed out)"
                     )
                     logger.warning("Job '%s': %s", job["id"], msg)
@@ -2302,7 +2322,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                target_cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=target_media_files,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -2331,7 +2358,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(
+                            asyncio.run,
+                            _send_to_platform(
+                                platform,
+                                pconfig,
+                                chat_id,
+                                target_cleaned_delivery_content,
+                                thread_id=thread_id,
+                                media_files=target_media_files,
+                            ),
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -4796,6 +4833,13 @@ def run_one_job(
             else:
                 deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
 
+            empty_response_error = None
+            if success and not final_response.strip():
+                empty_response_error = (
+                    "Agent completed but produced empty response "
+                    "(model error, timeout, or misconfiguration)"
+                )
+
             # Owner-configured Discord project review routes override the cron's
             # broad/origin destination with exactly one review channel. The
             # policy is opt-in; absent config returns None and preserves the
@@ -4821,24 +4865,37 @@ def run_one_job(
                     success=success and bool(final_response.strip()),
                     error=(
                         error
-                        or (
-                            "Agent completed but produced empty response"
-                            if success and not final_response.strip()
-                            else None
-                        )
+                        or empty_response_error
                     ),
                     policy=discord_alert_policy,
                 )
             if prepared_discord_alert is not None:
                 if prepared_discord_alert.content:
                     delivery_job = dict(job)
-                    delivery_job["deliver"] = f"discord:{prepared_discord_alert.channel_id}"
+                    original_deliver = _normalize_deliver_value(
+                        job.get("deliver", "local")
+                    )
+                    discord_target = f"discord:{prepared_discord_alert.channel_id}"
+                    delivery_job["deliver"] = (
+                        discord_target
+                        if original_deliver == "local" or not deliver_content.strip()
+                        else f"{original_deliver},{discord_target}"
+                    )
+                    delivery_job["_discord_alert_suppress_unrouted"] = True
+                    delivery_job["_discord_alert_channel_id"] = (
+                        prepared_discord_alert.channel_id
+                    )
+                    delivery_job["_discord_alert_content"] = (
+                        prepared_discord_alert.content
+                    )
                     delivery_job["_discord_alert_metadata"] = dict(
                         prepared_discord_alert.metadata
                     )
-                    deliver_content = prepared_discord_alert.content
                 else:
-                    deliver_content = ""
+                    # Cooldown applies only to the Discord alert copy. Preserve
+                    # every original non-Discord target and its normal content.
+                    delivery_job = dict(job)
+                    delivery_job["_discord_alert_suppress_unrouted"] = True
             elif discord_alert_policy.channels:
                 # Once the narrow alert policy is configured, generic cron
                 # successes and unclassified noise must not spill into a broad
@@ -4848,7 +4905,10 @@ def run_one_job(
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
-            should_deliver = bool(deliver_content.strip())
+            should_deliver = bool(
+                deliver_content.strip()
+                or delivery_job.get("_discord_alert_content")
+            )
             if blocked_config_silent:
                 should_deliver = False
             unresolved_origin = False
@@ -4890,7 +4950,7 @@ def run_one_job(
         # (issue #8585)
         if success and not final_response.strip():
             success = False
-            error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+            error = empty_response_error
 
         if not _consume_interrupted_flag(job["id"]):
             if blocked_config:

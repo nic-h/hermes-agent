@@ -418,3 +418,72 @@ async def test_send_file_attachment_forum_uses_files_kwarg(tmp_path, monkeypatch
     assert isinstance(thread_kwargs.get("files"), list) and len(thread_kwargs["files"]) == 1
 
 
+@pytest.mark.asyncio
+async def test_send_file_attachment_disables_mentions_in_channel_and_forum(
+    tmp_path, monkeypatch,
+):
+    import plugins.platforms.discord.adapter as discord_platform
+
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"fake-mp4")
+    mention_policy = object()
+    monkeypatch.setattr(discord_platform, "_build_no_mentions", lambda: mention_policy)
+    monkeypatch.setattr(
+        discord_platform.discord,
+        "File",
+        lambda fp, filename=None, **kwargs: SimpleNamespace(fp=fp, filename=filename),
+    )
+
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sent_msg = SimpleNamespace(
+        id=99,
+        attachments=[SimpleNamespace(filename="clip.mp4")],
+    )
+    channel = SimpleNamespace(send=AsyncMock(return_value=sent_msg), type=0)
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    monkeypatch.setattr(adapter, "_is_forum_parent", lambda _ch: False)
+
+    result = await adapter.send_video(
+        "555",
+        str(video),
+        caption="@everyone review",
+        metadata={"discord_no_mentions": True},
+    )
+
+    assert result.success is True
+    assert channel.send.await_args.kwargs["allowed_mentions"] is mention_policy
+
+    created_thread = SimpleNamespace(
+        id=7,
+        message=SimpleNamespace(
+            id=8,
+            attachments=[SimpleNamespace(filename="clip.mp4")],
+        ),
+    )
+    forum_channel = SimpleNamespace(
+        id=7,
+        create_thread=AsyncMock(return_value=created_thread),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: forum_channel,
+        fetch_channel=AsyncMock(),
+    )
+    monkeypatch.setattr(adapter, "_is_forum_parent", lambda _ch: True)
+
+    result = await adapter.send_video(
+        "555",
+        str(video),
+        caption="@everyone review",
+        metadata={"discord_no_mentions": True},
+    )
+
+    assert result.success is True
+    assert (
+        forum_channel.create_thread.await_args.kwargs["allowed_mentions"]
+        is mention_policy
+    )
+
+

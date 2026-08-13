@@ -121,6 +121,39 @@ def test_project_preview_format_is_plain_language_and_actionable():
     assert "MEDIA:/tmp/preview.png" in text
 
 
+def test_project_preview_strips_complete_traceback_and_http_body_blocks():
+    text = format_cron_alert(
+        {"name": "Cunicula article preview"},
+        "Useful review body.\n"
+        "Traceback (most recent call last):\n"
+        "  File \"/srv/app.py\", line 99, in run\n"
+        "    do_thing(credential='trace-secret')\n"
+        "ValueError: rejected trace-secret\n"
+        "{\"error\": {\"credential\": \"trace-body-secret\"}}\n"
+        "Review note after traceback.\n"
+        "POST /v1/review -> 500\n"
+        "{\n"
+        "  \"credential\": \"http-body-secret\"\n"
+        "}\n"
+        "MEDIA:/tmp/preview.png\n"
+        "Review note after HTTP body.",
+        success=True,
+        project_kind="article_reviews",
+    )
+
+    assert "Useful review body." in text
+    assert "Review note after traceback." in text
+    assert "Review note after HTTP body." in text
+    assert "MEDIA:/tmp/preview.png" in text
+    assert "Traceback" not in text
+    assert "do_thing" not in text
+    assert "ValueError" not in text
+    assert "trace-secret" not in text
+    assert "trace-body-secret" not in text
+    assert "POST /v1/review" not in text
+    assert "http-body-secret" not in text
+
+
 def test_failure_format_classifies_error_without_leaking_http_body_or_stack():
     text = format_cron_alert(
         {"id": "cron-42", "name": "Nichamilton social draft"},

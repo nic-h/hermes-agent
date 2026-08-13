@@ -177,6 +177,32 @@ class TestDiscordMultiImage:
         a._client = MagicMock()
         return a
 
+    def test_local_batch_disables_mentions(self, adapter, monkeypatch, tmp_path):
+        import plugins.platforms.discord.adapter as discord_adapter
+
+        image = tmp_path / "review.png"
+        image.write_bytes(b"\x89PNG")
+        mention_policy = object()
+        monkeypatch.setattr(
+            discord_adapter,
+            "_build_no_mentions",
+            lambda: mention_policy,
+        )
+        channel = MagicMock()
+        channel.send = AsyncMock(return_value=MagicMock(id=1))
+        adapter._client.get_channel = MagicMock(return_value=channel)
+        adapter._is_forum_parent = MagicMock(return_value=False)
+
+        _run(
+            adapter.send_multiple_images(
+                "67890",
+                [(f"file://{image}", "@everyone review")],
+                metadata={"discord_no_mentions": True},
+            )
+        )
+
+        assert channel.send.await_args.kwargs["allowed_mentions"] is mention_policy
+
 
     def test_url_batch_follows_safe_redirect_location_header(self, adapter, monkeypatch):
         """Redirect handling preserves aiohttp's case-insensitive Location behavior."""

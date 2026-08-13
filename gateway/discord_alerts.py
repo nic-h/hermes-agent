@@ -165,14 +165,98 @@ def failure_fingerprint(error: str | None) -> str:
 def _sanitized_payload(content: str, *, max_chars: int = 12000) -> str:
     """Keep useful review text/media while dropping transport and debug noise."""
     kept: list[str] = []
+    in_traceback = False
+    drop_json_after_error = False
+    json_depth = 0
+    awaiting_http_body = False
+
+    def _json_balance(text: str) -> int:
+        """Count structural JSON braces while ignoring quoted string content."""
+        depth = 0
+        in_string = False
+        escaped = False
+        for char in text:
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\" and in_string:
+                escaped = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if not in_string:
+                if char in "[{":
+                    depth += 1
+                elif char in "]}":
+                    depth -= 1
+        return depth
+
     for raw_line in str(content or "").splitlines():
         line = raw_line.rstrip()
         stripped = line.strip()
         lowered = stripped.casefold()
+
+        if json_depth:
+            json_depth += _json_balance(line)
+            if json_depth <= 0:
+                json_depth = 0
+                awaiting_http_body = False
+                drop_json_after_error = False
+            continue
+
+        if in_traceback:
+            if not stripped:
+                continue
+            if stripped.startswith("MEDIA:"):
+                in_traceback = False
+            elif re.match(
+                r"^[\w.]+(?:error|exception|warning|interrupt|exit)\b(?::|$)",
+                stripped,
+                re.IGNORECASE,
+            ):
+                in_traceback = False
+                drop_json_after_error = True
+                continue
+            elif line[:1].isspace() or re.match(
+                r'^file\s+".*",\s+line\s+\d+', lowered
+            ) or lowered.startswith((
+                "during handling of the above exception",
+                "the above exception was the direct cause",
+            )):
+                continue
+            else:
+                in_traceback = False
+
         if not stripped:
+            if awaiting_http_body:
+                awaiting_http_body = False
             if kept and kept[-1] != "":
                 kept.append("")
             continue
+
+        if lowered.startswith("traceback"):
+            in_traceback = True
+            continue
+
+        is_http_status = bool(
+            re.match(r"^http(?:statuserror)?\s*\d{3}\b", lowered)
+            or re.match(r"^https?://.*\b[45]\d{2}\b", lowered)
+            or re.match(r"^[a-z]+\s+/\S*.*(?:->|\s)\s*[45]\d{2}\b", lowered)
+        )
+        if is_http_status:
+            awaiting_http_body = True
+            continue
+
+        if (drop_json_after_error or awaiting_http_body) and stripped[:1] in "[{":
+            json_depth = max(0, _json_balance(line))
+            if json_depth == 0:
+                awaiting_http_body = False
+                drop_json_after_error = False
+            continue
+
+        drop_json_after_error = False
+        awaiting_http_body = False
         if stripped.startswith("MEDIA:"):
             kept.append(stripped)
             continue
@@ -180,9 +264,7 @@ def _sanitized_payload(content: str, *, max_chars: int = 12000) -> str:
             lowered.startswith("cronjob response:")
             or lowered.startswith("(job_id:")
             or re.fullmatch(r"[-=_]{5,}", stripped)
-            or lowered.startswith("traceback")
             or re.match(r'^file\s+".*",\s+line\s+\d+', lowered)
-            or re.match(r"^http(?:statuserror)?\s*\d{3}\b", lowered)
             or re.match(r"^\d{4}-\d{2}-\d{2}.*\b(?:debug|info|warning|error)\b", lowered)
         ):
             continue

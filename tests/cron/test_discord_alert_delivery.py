@@ -1,9 +1,11 @@
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 
 from cron.scheduler import (
     _deliver_result,
     _filter_unrouted_discord_targets,
+    _resolve_delivery_targets,
     run_one_job,
 )
 from gateway.discord_alerts import DiscordAlertPolicy
@@ -49,16 +51,20 @@ def test_run_one_job_routes_cunicula_preview_without_legacy_cron_wrapper():
         assert run_one_job(job) is True
 
     routed_job, content = deliver.call_args.args
-    assert routed_job["deliver"] == f"discord:{ARTICLE_CHANNEL}"
+    assert routed_job["deliver"] == f"all,discord:{ARTICLE_CHANNEL}"
+    assert routed_job["_discord_alert_suppress_unrouted"] is True
+    assert routed_job["_discord_alert_channel_id"] == ARTICLE_CHANNEL
+    alert_content = routed_job["_discord_alert_content"]
     assert routed_job["_discord_alert_metadata"] == {
         "non_conversational": True,
         "discord_no_mentions": True,
     }
-    assert "What happened:" in content
-    assert "Approve, Request changes, or Hold" in content
-    assert "preview body" in content
-    assert "Cronjob Response" not in content
-    assert "cunicula-integration-route" not in content
+    assert "What happened:" in alert_content
+    assert "Approve, Request changes, or Hold" in alert_content
+    assert "preview body" in alert_content
+    assert "Cronjob Response" not in alert_content
+    assert "cunicula-integration-route" not in alert_content
+    assert content == "preview body"
 
 
 def test_empty_project_result_routes_as_failure_not_false_review_recovery():
@@ -82,9 +88,118 @@ def test_empty_project_result_routes_as_failure_not_false_review_recovery():
 
     routed_job, content = deliver.call_args.args
     assert routed_job["deliver"] == f"discord:{ERRORS_CHANNEL}"
-    assert "did not complete" in content
-    assert "result is ready" not in content
-    assert "recovered" not in content
+    alert_content = routed_job["_discord_alert_content"]
+    assert "scheduled review was not produced" in alert_content
+    assert "result is ready" not in alert_content
+    assert "recovered" not in alert_content
+    assert not content
+
+
+def test_routed_failure_appends_discord_without_losing_non_discord_targets():
+    job = {
+        "id": "mixed-failure-route",
+        "name": "Nightly maintenance",
+        "deliver": ["telegram:222"],
+        "schedule": {"kind": "interval", "minutes": 60},
+    }
+
+    with patch("cron.scheduler.claim_dispatch", return_value=True), patch(
+        "cron.scheduler.create_execution", return_value={"id": "execution-mixed-1"}
+    ), patch("cron.scheduler.mark_execution_running"), patch(
+        "cron.scheduler.run_job",
+        return_value=(False, "saved output", "", "connection timeout"),
+    ), patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), patch(
+        "cron.scheduler.mark_job_run"
+    ), patch("cron.scheduler.finish_execution"), patch(
+        "gateway.discord_alerts.load_discord_alert_policy", return_value=_policy()
+    ), patch("cron.scheduler._deliver_result", return_value=None) as deliver:
+        assert run_one_job(job) is True
+
+    routed_job, content = deliver.call_args.args
+    assert routed_job["deliver"] == f"telegram:222,discord:{ERRORS_CHANNEL}"
+    assert routed_job["_discord_alert_suppress_unrouted"] is True
+    assert routed_job["_discord_alert_channel_id"] == ERRORS_CHANNEL
+    assert routed_job["_discord_alert_content"].startswith("What happened:")
+    assert routed_job["_discord_alert_content"] != content
+    assert content.strip()
+
+
+def test_cooldown_suppresses_only_discord_and_keeps_non_discord_delivery():
+    job = {
+        "id": "mixed-cooldown-route",
+        "name": "Nightly maintenance",
+        "deliver": ["telegram:222"],
+        "schedule": {"kind": "interval", "minutes": 60},
+    }
+
+    def run_once(execution_id):
+        with patch("cron.scheduler.claim_dispatch", return_value=True), patch(
+            "cron.scheduler.create_execution", return_value={"id": execution_id}
+        ), patch("cron.scheduler.mark_execution_running"), patch(
+            "cron.scheduler.run_job",
+            return_value=(False, "saved output", "", "connection timeout"),
+        ), patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), patch(
+            "cron.scheduler.mark_job_run"
+        ), patch("cron.scheduler.finish_execution"), patch(
+            "gateway.discord_alerts.load_discord_alert_policy", return_value=_policy()
+        ), patch("cron.scheduler._deliver_result", return_value=None) as deliver:
+            assert run_one_job(job) is True
+        return deliver.call_args.args
+
+    first_job, _ = run_once("execution-cooldown-1")
+    second_job, second_content = run_once("execution-cooldown-2")
+
+    assert first_job["deliver"] == f"telegram:222,discord:{ERRORS_CHANNEL}"
+    assert second_job["deliver"] == ["telegram:222"]
+    assert second_job["_discord_alert_suppress_unrouted"] is True
+    assert "_discord_alert_content" not in second_job
+    assert second_content.strip()
+
+
+def test_deliver_result_selects_alert_content_only_for_discord_target():
+    from gateway.config import Platform
+
+    normal_content = "normal cron failure summary"
+    alert_content = (
+        "What happened: Nightly maintenance timed out.\n"
+        "Impact: The scheduled review was not produced.\n"
+        "Action: Check provider availability."
+    )
+    job = {
+        "id": "per-target-content-route",
+        "name": "Nightly maintenance",
+        "deliver": f"telegram:222,discord:{ERRORS_CHANNEL}",
+        "_discord_alert_suppress_unrouted": True,
+        "_discord_alert_channel_id": ERRORS_CHANNEL,
+        "_discord_alert_content": alert_content,
+        "_discord_alert_metadata": {
+            "non_conversational": True,
+            "discord_no_mentions": True,
+        },
+    }
+    config = SimpleNamespace(
+        platforms={
+            Platform.TELEGRAM: SimpleNamespace(enabled=True),
+            Platform.DISCORD: SimpleNamespace(enabled=True),
+        }
+    )
+
+    with patch(
+        "gateway.config.load_gateway_config", return_value=config
+    ), patch(
+        "cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}
+    ), patch(
+        "tools.send_message_tool._send_to_platform",
+        new=AsyncMock(return_value={"success": True}),
+    ) as send:
+        assert _deliver_result(job, normal_content) is None
+
+    by_platform = {
+        call.args[0]: call.args[3]
+        for call in send.await_args_list
+    }
+    assert by_platform[Platform.TELEGRAM] == normal_content
+    assert by_platform[Platform.DISCORD] == alert_content
 
 
 def test_silent_project_result_remains_silent_instead_of_becoming_review_alert():
@@ -155,6 +270,23 @@ def test_unrouted_filter_keeps_explicit_discord_and_non_discord_targets():
     assert explicit_suppressed == 0
     assert kept_broad == [targets[1]]
     assert broad_suppressed == 1
+
+
+def test_unrouted_filter_keeps_discord_origin_target():
+    job = {
+        "deliver": "origin",
+        "origin": {
+            "platform": "discord",
+            "chat_id": "555000111",
+            "thread_id": "777",
+        },
+    }
+    targets = _resolve_delivery_targets(job)
+
+    kept, suppressed = _filter_unrouted_discord_targets(job, targets)
+
+    assert kept == targets
+    assert suppressed == 0
 
 
 def test_deliver_result_marks_all_filtered_discord_targets_as_suppressed():
