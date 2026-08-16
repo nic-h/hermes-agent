@@ -513,10 +513,10 @@ def test_run_as_host_user_drops_setuid_setgid_caps(monkeypatch):
     assert "SETGID" not in added, (
         "SETGID cap should be dropped when running as host user — no privilege drop is needed"
     )
-    # Core non-privilege-drop caps must still be there (pip/npm/apt need them).
-    assert "DAC_OVERRIDE" in added
-    assert "CHOWN" in added
-    assert "FOWNER" in added
+    # A process that already starts as a non-root uid should receive no added
+    # capabilities. Package managers may write only inside directories the
+    # uid owns; they must not regain root-style DAC/chown powers.
+    assert added == set()
 
 
 # ── Docker labels (issue #20561) ──────────────────────────────────

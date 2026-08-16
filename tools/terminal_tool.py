@@ -1089,6 +1089,7 @@ PTY: set pty=true for interactive CLIs (they hang without it). Pipe git output t
 # Global state for environment lifecycle management
 _active_environments: Dict[str, Any] = {}
 _last_activity: Dict[str, float] = {}
+_created_at: Dict[str, float] = {}
 _env_lock = threading.Lock()
 _creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
@@ -1657,6 +1658,7 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
+        "max_lifetime_seconds": _parse_env_var("TERMINAL_MAX_LIFETIME_SECONDS", "0"),
         # SSH-specific config
         "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
         "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
@@ -1680,6 +1682,10 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_env": docker_env,
         "docker_run_as_host_user": os.getenv("TERMINAL_DOCKER_RUN_AS_HOST_USER", "false").lower() in {"true", "1", "yes"},
         "docker_network": os.getenv("TERMINAL_DOCKER_NETWORK", "true").lower() in {"true", "1", "yes"},
+        "docker_mount_credentials": os.getenv("TERMINAL_DOCKER_MOUNT_CREDENTIALS", "true").lower() in {"true", "1", "yes"},
+        "docker_mount_skills": os.getenv("TERMINAL_DOCKER_MOUNT_SKILLS", "true").lower() in {"true", "1", "yes"},
+        "docker_mount_caches": os.getenv("TERMINAL_DOCKER_MOUNT_CACHES", "true").lower() in {"true", "1", "yes"},
+        "docker_require_resource_limits": os.getenv("TERMINAL_DOCKER_REQUIRE_RESOURCE_LIMITS", "false").lower() in {"true", "1", "yes"},
         "docker_extra_args": docker_extra_args,
         "docker_shm_size": docker_shm_size,
         # Cross-process container reuse (issue #20561).  The docs claim
@@ -1744,6 +1750,10 @@ def _container_config_from_config(config: Dict[str, Any]) -> dict:
         "docker_forward_env": config.get("docker_forward_env", []),
         "docker_env": config.get("docker_env", {}),
         "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+        "docker_mount_credentials": config.get("docker_mount_credentials", True),
+        "docker_mount_skills": config.get("docker_mount_skills", True),
+        "docker_mount_caches": config.get("docker_mount_caches", True),
+        "docker_require_resource_limits": config.get("docker_require_resource_limits", False),
         "docker_extra_args": config.get("docker_extra_args", []),
         "docker_shm_size": config.get("docker_shm_size", "1g"),
         "docker_network": config.get("docker_network", True),
@@ -1824,6 +1834,10 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                 else cc.get("docker_persist_across_processes", True)
             ),
             shm_size=cc.get("docker_shm_size", "1g"),
+            mount_credentials=cc.get("docker_mount_credentials", True),
+            mount_skills=cc.get("docker_mount_skills", True),
+            mount_caches=cc.get("docker_mount_caches", True),
+            require_resource_limits=cc.get("docker_require_resource_limits", False),
         )
         # Marker read by is_persistent_env(): a session-scoped container
         # survives BETWEEN turns (skip per-turn teardown) but is removed at
@@ -1944,8 +1958,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         )
 
 
-def _cleanup_inactive_envs(lifetime_seconds: int = 300):
-    """Clean up environments that have been inactive for longer than lifetime_seconds."""
+def _cleanup_inactive_envs(lifetime_seconds: int = 300, max_lifetime_seconds: int = 0):
+    """Clean up idle environments and enforce an optional hard maximum age."""
     current_time = time.time()
 
     # Check the process registry -- skip cleanup for sandboxes with active
@@ -1966,9 +1980,16 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
 
     with _env_lock:
         for task_id, last_time in list(_last_activity.items()):
-            if current_time - last_time > lifetime_seconds:
+            created_time = _created_at.get(task_id, last_time)
+            idle_expired = current_time - last_time > lifetime_seconds
+            hard_expired = (
+                max_lifetime_seconds > 0
+                and current_time - created_time > max_lifetime_seconds
+            )
+            if idle_expired or hard_expired:
                 env = _active_environments.pop(task_id, None)
                 _last_activity.pop(task_id, None)
+                _created_at.pop(task_id, None)
                 if env is not None:
                     envs_to_stop.append((task_id, env))
 
@@ -2011,7 +2032,10 @@ def _cleanup_thread_worker():
     while _cleanup_running:
         try:
             config = _get_env_config()
-            _cleanup_inactive_envs(config["lifetime_seconds"])
+            _cleanup_inactive_envs(
+                config["lifetime_seconds"],
+                config.get("max_lifetime_seconds", 0),
+            )
         except Exception as e:
             logger.warning("Error in cleanup thread: %s", e, exc_info=True)
 
@@ -2126,7 +2150,9 @@ def ensure_task_env(task_id: Optional[str] = None):
 
         with _env_lock:
             _active_environments[effective_task_id] = new_env
-            _last_activity[effective_task_id] = time.time()
+            registered_at = time.time()
+            _last_activity[effective_task_id] = registered_at
+            _created_at[effective_task_id] = registered_at
         logger.info(
             "%s environment lazily initialized for task %s",
             env_type, effective_task_id[:8],
@@ -2215,6 +2241,7 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     with _env_lock:
         env = _active_environments.pop(task_id, None)
         _last_activity.pop(task_id, None)
+        _created_at.pop(task_id, None)
 
     # Clean up per-task creation lock
     with _creation_locks_lock:
@@ -2761,7 +2788,9 @@ def terminal_tool(
 
                     with _env_lock:
                         _active_environments[effective_task_id] = new_env
-                        _last_activity[effective_task_id] = time.time()
+                        registered_at = time.time()
+                        _last_activity[effective_task_id] = registered_at
+                        _created_at[effective_task_id] = registered_at
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 
@@ -3565,6 +3594,7 @@ def _evict_environment_for_task(task_id: Optional[str]) -> None:
         for key in keys:
             env = _active_environments.pop(key, None)
             _last_activity.pop(key, None)
+            _created_at.pop(key, None)
             if env is not None:
                 evicted.append(env)
     for env in evicted:

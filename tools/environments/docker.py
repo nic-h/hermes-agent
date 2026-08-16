@@ -100,6 +100,33 @@ def _normalize_env_dict(env: dict | None) -> dict[str, str]:
     return normalized
 
 
+def _redact_docker_args(args: list[str]) -> list[str]:
+    """Return log-safe Docker argv without environment-variable values.
+
+    Docker must still receive ``-e KEY=value`` at execution time, but logs
+    should expose only the variable name.  This also handles ``--env=...``
+    and the split ``--env KEY=value`` spelling.
+    """
+    redacted: list[str] = []
+    redact_next = False
+    for raw_arg in args:
+        arg = str(raw_arg)
+        if redact_next:
+            redacted.append(arg.split("=", 1)[0] + "=<redacted>")
+            redact_next = False
+            continue
+        if arg in {"-e", "--env"}:
+            redacted.append(arg)
+            redact_next = True
+            continue
+        if arg.startswith("--env="):
+            assignment = arg[len("--env="):]
+            redacted.append("--env=" + assignment.split("=", 1)[0] + "=<redacted>")
+            continue
+        redacted.append(arg)
+    return redacted
+
+
 def _load_hermes_env_vars() -> dict[str, str]:
     """Load ~/.hermes/.env values without failing Docker command execution."""
     try:
@@ -342,12 +369,18 @@ def find_docker() -> Optional[str]:
 # reason.
 _BASE_SECURITY_ARGS = [
     "--cap-drop", "ALL",
-    "--cap-add", "DAC_OVERRIDE",
-    "--cap-add", "CHOWN",
-    "--cap-add", "FOWNER",
     "--security-opt", "no-new-privileges",
     "--tmpfs", "/tmp:rw,nosuid,size=512m",
     "--tmpfs", "/var/tmp:rw,noexec,nosuid,size=256m",
+]
+
+# Root-started containers need these to manage writable bind mounts and
+# package files. They are intentionally absent when Docker starts the process
+# as a non-root host uid via --user.
+_ROOT_WRITE_CAP_ARGS = [
+    "--cap-add", "DAC_OVERRIDE",
+    "--cap-add", "CHOWN",
+    "--cap-add", "FOWNER",
 ]
 
 # Default per-container PID limit. Applied as ``--pids-limit`` only when the
@@ -647,7 +680,7 @@ def _build_security_args(run_as_host_user: bool, run_exec: bool = False) -> list
     args = list(_BASE_SECURITY_ARGS) + run_tmpfs
     if run_as_host_user:
         return args
-    return args + list(_PRIVDROP_CAP_ARGS)
+    return args + list(_ROOT_WRITE_CAP_ARGS) + list(_PRIVDROP_CAP_ARGS)
 
 
 def _image_uses_init_entrypoint(docker_exe: str, image: str) -> bool:
@@ -887,6 +920,10 @@ class DockerEnvironment(BaseEnvironment):
         extra_args: list = None,
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
+        mount_credentials: bool = True,
+        mount_skills: bool = True,
+        mount_caches: bool = True,
+        require_resource_limits: bool = False,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -921,11 +958,17 @@ class DockerEnvironment(BaseEnvironment):
         # e.g. unprivileged LXCs). The probe runs once per process and is
         # cached host-wide.
         resource_args = []
-        if cpu > 0 and _cgroup_limits_available(image):
+        cgroup_limits_available = _cgroup_limits_available(image)
+        if require_resource_limits and not cgroup_limits_available:
+            raise RuntimeError(
+                "Docker security profile requires CPU, memory, and PID limits, "
+                "but the cgroup capability probe failed"
+            )
+        if cpu > 0 and cgroup_limits_available:
             resource_args.extend(["--cpus", str(cpu)])
-        if memory > 0 and _cgroup_limits_available(image):
+        if memory > 0 and cgroup_limits_available:
             resource_args.extend(["--memory", f"{memory}m"])
-        if _cgroup_limits_available(image):
+        if cgroup_limits_available:
             resource_args.extend(["--pids-limit", _DEFAULT_PIDS_LIMIT])
         # /dev/shm size (not cgroup-gated: --shm-size is a tmpfs mount option,
         # no controller delegation required). Skip when the user already sets
@@ -1017,7 +1060,7 @@ class DockerEnvironment(BaseEnvironment):
                 get_cache_directory_mounts,
             )
 
-            for mount_entry in get_credential_file_mounts():
+            for mount_entry in get_credential_file_mounts() if mount_credentials else []:
                 src = Path(mount_entry["host_path"])
                 if src.is_dir():
                     # Docker-in-Docker: Docker auto-created the source path as
@@ -1046,7 +1089,7 @@ class DockerEnvironment(BaseEnvironment):
 
             # Mount skill directories (local + external) so skill
             # scripts/templates are available inside the container.
-            for skills_mount in get_skills_directory_mount():
+            for skills_mount in get_skills_directory_mount() if mount_skills else []:
                 src = Path(skills_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -1068,7 +1111,7 @@ class DockerEnvironment(BaseEnvironment):
             # screenshots) so the agent can access uploaded files and other
             # cached media from inside the container.  Read-only — the
             # container reads these but the host gateway manages writes.
-            for cache_mount in get_cache_directory_mounts():
+            for cache_mount in get_cache_directory_mounts() if mount_caches else []:
                 src = Path(cache_mount["host_path"])
                 if not src.is_dir():
                     logger.warning(
@@ -1357,7 +1400,7 @@ class DockerEnvironment(BaseEnvironment):
             + env_args
             + validated_extra
         )
-        logger.info("Docker run_args: %s", all_run_args)
+        logger.info("Docker run_args: %s", _redact_docker_args(all_run_args))
 
         # Start the container directly via `docker run -d`.
         container_name = f"hermes-{uuid.uuid4().hex[:8]}"
@@ -1486,7 +1529,7 @@ class DockerEnvironment(BaseEnvironment):
                 image,
                 "sleep", "infinity",  # no fixed lifetime — idle reaper handles cleanup
             ]
-            logger.debug("Starting container: %s", ' '.join(run_cmd))
+            logger.debug("Starting container: %s", ' '.join(_redact_docker_args(run_cmd)))
             try:
                 result = subprocess.run(
                     run_cmd,

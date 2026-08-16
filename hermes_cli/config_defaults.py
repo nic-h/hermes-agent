@@ -309,6 +309,9 @@ DEFAULT_CONFIG = {
         # it here without patching the built desktop app.
         "font_family": "",
         "timeout": 180,
+        # Hard maximum container age. Unlike lifetime_seconds (idle timeout),
+        # active background processes cannot extend this deadline. 0 disables.
+        "max_lifetime_seconds": 0,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this
@@ -382,9 +385,17 @@ DEFAULT_CONFIG = {
         # Explicit opt-in: mount the host cwd into /workspace for Docker sessions.
         # Default off because passing host directories into a sandbox weakens isolation.
         "docker_mount_cwd_to_workspace": False,
+        # Auto-mounted host material. Security profiles can disable each class
+        # independently and stage only explicit task inputs.
+        "docker_mount_credentials": True,
+        "docker_mount_skills": True,
+        "docker_mount_caches": True,
         # Opt-in egress lockdown for Docker terminal sessions. When false,
         # Docker runs with --network=none so commands cannot reach the network.
         "docker_network": True,
+        # Fail closed instead of silently omitting CPU/memory/PID limits when
+        # the host cgroup capability probe fails.
+        "docker_require_resource_limits": False,
         "docker_extra_args": [],        # Extra flags passed verbatim to docker run
         # /dev/shm size for the Docker sandbox. Docker's 64 MB default silently
         # breaks Chromium/Playwright and PyTorch DataLoader workers; tmpfs is
