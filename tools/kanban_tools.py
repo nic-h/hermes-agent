@@ -1463,7 +1463,15 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
-            subscribed = _maybe_auto_subscribe(conn, new_tid)
+            subscribed = _maybe_auto_subscribe(
+                conn,
+                new_tid,
+                board=str(board or kb.get_current_board()),
+                project_id=str(
+                    (new_task.project_id if new_task else project_id) or ""
+                ),
+                branch_name=str(new_task.branch_name or "") if new_task else "",
+            )
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -1481,8 +1489,15 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
-def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
-    """Auto-subscribe the calling session to task completion / block events.
+def _maybe_auto_subscribe(
+    conn: Any,
+    task_id: str,
+    *,
+    board: str = "",
+    project_id: str = "",
+    branch_name: str = "",
+) -> bool:
+    """Auto-subscribe the work feed and, when available, the calling session.
 
     Returns True if a subscription row was written, False otherwise (no
     session context, config gate disabled, or best-effort failure). The
@@ -1511,18 +1526,45 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
       for these rows and posts the completion message into the running
       session.
 
-    - **CLI / cron / test / unattached**: no persistent delivery channel,
-      no-op.
+    - **CLI / cron / test / unattached**: no origin channel, but the configured
+      default-profile Discord work feed still receives lifecycle updates.
 
     Failure mode: any exception inside the function is logged at WARNING
     with the offending exception + diagnostic env vars and swallowed.
     We never want a notification bookkeeping failure to fail the
     kanban_create that the agent is mid-conversation about.
     """
+    subscribed = False
+    try:
+        from gateway.discord_alerts import (
+            kanban_project_subject,
+            load_default_discord_alert_policy,
+        )
+        from hermes_cli import kanban_db as _kb
+
+        policy = load_default_discord_alert_policy()
+        work_channel = policy.kanban_channel_for(
+            board=board,
+            project_id=kanban_project_subject(project_id, branch_name),
+        )
+        if work_channel:
+            # Register this first. If origin is the same Discord tuple, the
+            # DB uniqueness key merges both paths under the default notifier.
+            _kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="discord",
+                chat_id=work_channel,
+                notifier_profile="default",
+            )
+            subscribed = True
+    except Exception as _exc:
+        logger.warning("Discord work-feed auto-subscribe failed: %r", _exc)
+
     try:
         cfg = load_config()
         if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
-            return False
+            return subscribed
     except Exception:
         # If config can't load we still default to True — this is the
         # user-friendly behaviour that mirrors the pre-gate implementation.
@@ -1553,7 +1595,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 or os.environ.get("HERMES_SESSION_KEY", "")
             )
             if not session_key:
-                return False  # CLI / cron / test — no persistent channel
+                return subscribed  # No originating persistent channel.
             platform = "tui"
             chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
@@ -1602,7 +1644,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
             _exc, platform, bool(chat_id),
         )
-        return False
+        return subscribed
 
 
 def _handle_unblock(args: dict, **kw) -> str:

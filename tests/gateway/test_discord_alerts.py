@@ -1,11 +1,15 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 
 from gateway.discord_alerts import (
     DiscordAlertDeduper,
     DiscordAlertPolicy,
     discord_alert_metadata,
     format_cron_alert,
+    format_kanban_alert,
+    kanban_project_subject,
     load_discord_alert_policy,
     prepare_cron_alert,
     prepare_gateway_alert,
@@ -21,6 +25,8 @@ CHANNELS = {
     "article_reviews": "1535574256128106538",
     "social_reviews": "1535574257927716894",
 }
+PROJECT_KANBAN_CHANNEL = "111111111111111111"
+SHORT_PREFIX_CHANNEL = "222222222222222222"
 
 
 def _policy():
@@ -29,6 +35,9 @@ def _policy():
             "gateway": {
                 "discord_alerts": {
                     "channels": CHANNELS,
+                    "kanban_routes": {
+                        "cunicula*": PROJECT_KANBAN_CHANNEL,
+                    },
                     "projects": {
                         "article_reviews": ["cunicula"],
                         "social_reviews": ["cunicula social", "nichamilton"],
@@ -52,6 +61,30 @@ def test_policy_routes_each_alert_class_to_one_configured_channel():
     # Unknown projects do not spill into a broad status, general, or home channel.
     assert policy.channel_for("project", subject="unrelated campaign") is None
     assert policy.channel_for("unknown", subject="Cunicula") is None
+
+
+def test_policy_routes_kanban_projects_and_boards_by_longest_bounded_prefix():
+    policy = DiscordAlertPolicy.from_config(
+        {
+            "gateway": {
+                "discord_alerts": {
+                    "channels": {"kanban": CHANNELS["kanban"]},
+                    "kanban_routes": {
+                        "cun*": SHORT_PREFIX_CHANNEL,
+                        "cunicula*": PROJECT_KANBAN_CHANNEL,
+                    },
+                }
+            }
+        }
+    )
+
+    assert policy.kanban_channel_for(project_id="cunicula-site") == PROJECT_KANBAN_CHANNEL
+    assert policy.kanban_channel_for(board="cunicula-editor") == PROJECT_KANBAN_CHANNEL
+    assert policy.kanban_channel_for(project_id="other") == CHANNELS["kanban"]
+    assert policy.is_kanban_channel(PROJECT_KANBAN_CHANNEL)
+    assert policy.is_kanban_channel(CHANNELS["kanban"])
+    assert kanban_project_subject("p_opaque", "cunicula-site/t_task") == "cunicula-site"
+    assert kanban_project_subject("p_opaque", "") == "p_opaque"
 
 
 def test_policy_is_opt_in_and_rejects_invalid_channel_values():
@@ -328,19 +361,71 @@ def test_gateway_status_alerts_dedupe_failure_and_emit_one_recovery():
     assert extra_recovery is not None and extra_recovery.content == ""
 
 
-def test_prepared_kanban_alert_replaces_origin_thread_with_single_update_channel():
+@pytest.mark.parametrize(
+    ("state", "heading", "needs_you"),
+    [
+        ("claimed", "Started:", "Nothing"),
+        ("heartbeat", "Status:", "Nothing"),
+        ("still_working", "Status:", "Nothing"),
+        ("status", "Status:", "Nothing"),
+        ("gave_up", "Status:", "Nothing"),
+        ("crashed", "Status:", "Nothing"),
+        ("timed_out", "Status:", "Nothing"),
+        ("blocked", "Needs you:", None),
+        ("block_loop_detected", "Needs you:", None),
+        ("completed", "Done:", "Nothing"),
+        ("review_requested", "Review:", "Review this result."),
+    ],
+)
+def test_kanban_lifecycle_alerts_are_human_and_hide_internal_vocabulary(
+    state, heading, needs_you,
+):
+    text = format_kanban_alert(
+        state,
+        title="Ship the real owner feed",
+        summary=(
+            "Useful owner summary. Kanban t_deadbeef @worker board=secret "
+            "profile=builder dispatcher retry pid=42 RuntimeError: raw exception"
+        ),
+    )
+
+    assert text.startswith(heading)
+    assert "Ship the real owner feed" in text
+    assert len(text) < 1200
+    if needs_you is not None:
+        assert f"Needs you: {needs_you}" in text
+    else:
+        assert text.startswith("Needs you: Useful owner summary.")
+    for hidden in (
+        "t_deadbeef", "@worker", "board=secret", "profile=builder",
+        "Kanban", "dispatcher", "retry", "pid=42", "RuntimeError",
+        "raw exception",
+    ):
+        assert hidden not in text
+
+
+def test_prepared_kanban_alert_uses_project_route_and_strips_source_metadata():
     alert = prepare_kanban_alert(
-        "DONE: @worker Kanban t_123 — shipped\nDelivery: receipt is ready for review",
-        metadata={"thread_id": "old-thread", "chat_type": "channel"},
+        "completed",
+        title="Ship the real owner feed",
+        summary="Receipt is ready.",
+        board="default",
+        project_id="cunicula-site",
+        metadata={
+            "thread_id": "old-thread",
+            "reply_to_message_id": "source-message",
+            "attachments": ["huge-report.pdf"],
+            "file_path": "/tmp/huge-report.pdf",
+            "chat_type": "channel",
+        },
         policy=_policy(),
     )
 
     assert alert is not None
-    assert alert.channel_id == CHANNELS["kanban"]
-    assert alert.content.startswith("What happened: DONE:")
-    assert "receipt is ready for review" in alert.content
+    assert alert.channel_id == PROJECT_KANBAN_CHANNEL
+    assert alert.content.startswith("Done: Ship the real owner feed")
+    assert "Receipt is ready." in alert.content
     assert alert.metadata == {
-        "chat_type": "channel",
         "non_conversational": True,
         "discord_no_mentions": True,
     }

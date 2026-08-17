@@ -17,6 +17,8 @@ Configuration shape::
         projects:
           article_reviews: ["article-project-keyword"]
           social_reviews: ["social-project-keyword"]
+        kanban_routes:
+          "project-or-board-prefix*": "<channel-id>"
         cooldown_seconds: 600
 """
 
@@ -36,6 +38,9 @@ _CHANNEL_KEYS = frozenset(
 )
 _PROJECT_KEYS = ("article_reviews", "social_reviews")
 _DISCORD_CHANNEL_RE = re.compile(r"^\d{15,22}$")
+_KANBAN_ROUTE_LIMIT = 64
+_KANBAN_ROUTE_PREFIX_LIMIT = 80
+_KANBAN_ALERT_MAX_CHARS = 1199
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -53,6 +58,7 @@ class DiscordAlertPolicy:
 
     channels: Mapping[str, str]
     projects: Mapping[str, tuple[str, ...]]
+    kanban_routes: tuple[tuple[str, str], ...] = ()
     cooldown_seconds: int = 600
 
     @classmethod
@@ -80,12 +86,35 @@ class DiscordAlertPolicy:
             if normalized:
                 projects[key] = normalized
 
+        kanban_routes: list[tuple[str, str]] = []
+        for raw_prefix, raw_channel in list(
+            _mapping(raw.get("kanban_routes")).items()
+        )[:_KANBAN_ROUTE_LIMIT]:
+            prefix = str(raw_prefix or "").strip().casefold()
+            if prefix.endswith("*"):
+                prefix = prefix[:-1].rstrip()
+            channel = _normalized_channel(raw_channel)
+            if (
+                not prefix
+                or len(prefix) > _KANBAN_ROUTE_PREFIX_LIMIT
+                or "*" in prefix
+                or channel is None
+            ):
+                continue
+            kanban_routes.append((prefix, channel))
+        kanban_routes.sort(key=lambda item: len(item[0]), reverse=True)
+
         try:
             cooldown = int(raw.get("cooldown_seconds", 600))
         except (TypeError, ValueError):
             cooldown = 600
         cooldown = max(1, min(cooldown, 86400))
-        return cls(channels=channels, projects=projects, cooldown_seconds=cooldown)
+        return cls(
+            channels=channels,
+            projects=projects,
+            kanban_routes=tuple(kanban_routes),
+            cooldown_seconds=cooldown,
+        )
 
     def project_kind(self, subject: str) -> Optional[str]:
         normalized = str(subject or "").casefold()
@@ -116,6 +145,31 @@ class DiscordAlertPolicy:
             return self.channels.get(project_kind) if project_kind else None
         return None
 
+    def kanban_channel_for(
+        self,
+        *,
+        board: str = "",
+        project_id: str = "",
+    ) -> Optional[str]:
+        """Return the longest project/board-prefix route, then the fallback."""
+        subjects = (
+            str(project_id or "").strip().casefold(),
+            str(board or "").strip().casefold(),
+        )
+        for prefix, channel in self.kanban_routes:
+            if any(subject.startswith(prefix) for subject in subjects if subject):
+                return channel
+        return self.channels.get("kanban")
+
+    def is_kanban_channel(self, channel_id: str) -> bool:
+        """Return whether a channel is configured as any work-feed target."""
+        normalized = str(channel_id or "").strip()
+        configured = {channel for _, channel in self.kanban_routes}
+        fallback = self.channels.get("kanban")
+        if fallback:
+            configured.add(fallback)
+        return normalized in configured
+
 
 def load_discord_alert_policy() -> DiscordAlertPolicy:
     """Read the current policy without caching live config changes."""
@@ -125,6 +179,34 @@ def load_discord_alert_policy() -> DiscordAlertPolicy:
         return DiscordAlertPolicy.from_config(load_config())
     except Exception:
         return DiscordAlertPolicy.from_config({})
+
+
+def load_default_discord_alert_policy() -> DiscordAlertPolicy:
+    """Read Discord work routing from the machine's default profile."""
+    try:
+        from hermes_cli.config import load_config
+        from hermes_constants import (
+            get_default_hermes_root,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        token = set_hermes_home_override(get_default_hermes_root())
+        try:
+            return DiscordAlertPolicy.from_config(load_config())
+        finally:
+            reset_hermes_home_override(token)
+    except Exception:
+        return DiscordAlertPolicy.from_config({})
+
+
+def kanban_project_subject(project_id: str = "", branch_name: str = "") -> str:
+    """Return a routeable project slug, falling back to its canonical ID."""
+    canonical = str(project_id or "").strip()
+    if not canonical:
+        return ""
+    prefix, separator, _ = str(branch_name or "").strip().partition("/")
+    return prefix if separator and prefix else canonical
 
 
 def discord_alert_metadata(metadata: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
@@ -385,22 +467,81 @@ def format_gateway_alert(state: str, *, detail: str = "") -> str:
     )
 
 
-def format_kanban_alert(message: str) -> str:
-    """Keep the useful lifecycle line while making the action explicit."""
-    lines = [part.strip() for part in str(message or "").splitlines() if part.strip()]
-    line = lines[0] if lines else "Kanban updated"
-    if len(line) > 360:
-        line = line[:357].rstrip() + "..."
-    detail = _sanitized_payload(" ".join(lines[1:]), max_chars=700)
-    impact = detail or "Task state changed."
-    state = line.split(":", 1)[0].strip().casefold()
-    if state in {"blocked", "gave_up"}:
-        action = "Resolve the blocker or inspect the task for the required input."
-    elif state in {"review", "review_requested"}:
-        action = "Review the task and record the decision."
+def _human_kanban_title(title: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(title or "")).strip() or "Untitled work"
+    return normalized if len(normalized) <= 220 else normalized[:217].rstrip() + "..."
+
+
+_KANBAN_INTERNAL_RE = re.compile(
+    r"(?:"
+    r"\bkanban\b|\bt_[a-z0-9]+\b|@[a-z0-9_-]+|"
+    r"\b(?:board|profile|assignee)\s*[:=]|"
+    r"\b(?:worker|agent|dispatcher|spawn|retry|pid|max_runtime|traceback)\b|"
+    r"\b[a-z_]*(?:error|exception)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _human_kanban_summary(summary: str, *, max_chars: int = 720) -> str:
+    """Keep owner-useful prose before transport, runtime, or fleet internals."""
+    sanitized = _sanitized_payload(str(summary or ""), max_chars=3000)
+    normalized = re.sub(r"\s+", " ", sanitized).strip()
+    internal = _KANBAN_INTERNAL_RE.search(normalized)
+    if internal is not None:
+        normalized = normalized[:internal.start()].rstrip(" ,;:-")
+    if len(normalized) > max_chars:
+        normalized = normalized[: max_chars - 3].rstrip() + "..."
+    return normalized
+
+
+def format_kanban_alert(
+    state: str,
+    *,
+    title: str,
+    summary: str = "",
+) -> str:
+    """Render one owner-facing lifecycle update without fleet internals."""
+    normalized = str(state or "status").strip().casefold()
+    subject = _human_kanban_title(title)
+    detail = _human_kanban_summary(summary)
+
+    if normalized == "claimed":
+        lines = [
+            f"Started: {subject}",
+            "Status: Work is underway.",
+            "Needs you: Nothing",
+        ]
+    elif normalized in {"blocked", "block_loop_detected"}:
+        lines = [
+            f"Needs you: {detail or 'Provide the missing input or decision.'}",
+            f"Status: {subject} cannot continue.",
+        ]
+    elif normalized == "completed":
+        lines = [f"Done: {subject}"]
+        if detail:
+            lines.append(detail)
+        lines.append("Needs you: Nothing")
+    elif normalized == "review_requested":
+        lines = [f"Review: {subject}"]
+        if detail:
+            lines.append(detail)
+        lines.append("Needs you: Review this result.")
     else:
-        action = "Review the Kanban update if input is requested."
-    return f"What happened: {line}\nImpact: {impact}\nAction: {action}"
+        if normalized in {"gave_up", "crashed", "timed_out"}:
+            detail = "The work paused. It will continue automatically if possible."
+        elif normalized == "still_working":
+            detail = "Work is still underway."
+        lines = [
+            f"Status: {subject}",
+            detail or "Work is underway.",
+            "Needs you: Nothing",
+        ]
+
+    rendered = "\n".join(lines)
+    if len(rendered) >= _KANBAN_ALERT_MAX_CHARS:
+        rendered = rendered[: _KANBAN_ALERT_MAX_CHARS - 3].rstrip() + "..."
+    return rendered
 
 
 class DiscordAlertDeduper:
@@ -614,22 +755,25 @@ def prepare_gateway_alert(
 
 
 def prepare_kanban_alert(
-    message: str,
+    state: str,
     *,
+    title: str,
+    summary: str = "",
+    board: str = "",
+    project_id: str = "",
     metadata: Optional[Mapping[str, Any]] = None,
     policy: Optional[DiscordAlertPolicy] = None,
 ) -> Optional[PreparedKanbanAlert]:
-    """Route a Kanban lifecycle update to the one configured Discord channel."""
+    """Route a Kanban lifecycle update to the configured Discord work feed."""
     resolved = policy or load_discord_alert_policy()
-    channel_id = resolved.channel_for("kanban")
+    channel_id = resolved.kanban_channel_for(board=board, project_id=project_id)
     if not channel_id:
         return None
-    routed_metadata = discord_alert_metadata(metadata)
-    routed_metadata.pop("thread_id", None)
     return PreparedKanbanAlert(
         channel_id=channel_id,
-        content=format_kanban_alert(message),
-        metadata=routed_metadata,
+        content=format_kanban_alert(state, title=title, summary=summary),
+        # Intentionally sever source reply/thread/file anchors for work feeds.
+        metadata=discord_alert_metadata(),
     )
 
 
@@ -719,6 +863,8 @@ __all__ = [
     "format_cron_alert",
     "format_gateway_alert",
     "format_kanban_alert",
+    "kanban_project_subject",
+    "load_default_discord_alert_policy",
     "load_discord_alert_policy",
     "prepare_cron_alert",
     "prepare_gateway_alert",

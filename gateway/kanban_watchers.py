@@ -549,7 +549,8 @@ class GatewayKanbanWatchersMixin:
                                 sub, d["status_reservation"], board_slug,
                             )
                         continue
-                    title = (task.title if task else sub["task_id"])[:120]
+                    owner_title = task.title if task else sub["task_id"]
+                    title = owner_title[:120]
                     board_tag = f"[{board_slug}] " if board_slug else ""
                     # Per-subscription failure-counter key. Hoisted out of the
                     # event loop: the wake self-post path (in the loop's
@@ -697,17 +698,63 @@ class GatewayKanbanWatchersMixin:
                             metadata["thread_id"] = sub["thread_id"]
 
                         send_chat_id = sub["chat_id"]
+                        is_discord_work_alert = False
                         if platform_str == "discord":
-                            from gateway.discord_alerts import prepare_kanban_alert
-
-                            prepared_alert = prepare_kanban_alert(
-                                msg,
-                                metadata=metadata,
+                            from gateway.discord_alerts import (
+                                discord_alert_metadata,
+                                format_kanban_alert,
+                                kanban_project_subject,
+                                load_discord_alert_policy,
+                                prepare_kanban_alert,
                             )
+
+                            owner_summary = ""
+                            payload = getattr(ev, "payload", None)
+                            if kind == "heartbeat" and payload:
+                                owner_summary = str(payload.get("note") or "")
+                            elif kind == "completed":
+                                owner_summary = str(
+                                    (payload or {}).get("summary")
+                                    or (task.result if task else "")
+                                    or ""
+                                )
+                            elif kind in {"blocked", "block_loop_detected"} and payload:
+                                owner_summary = str(payload.get("reason") or "")
+                            elif kind == "review_requested" and payload:
+                                owner_summary = str(payload.get("summary") or "")
+
+                            alert_policy = load_discord_alert_policy()
+                            is_discord_work_alert = (
+                                sub_profile == "default"
+                                and not (sub.get("thread_id") or "")
+                                and alert_policy.is_kanban_channel(send_chat_id)
+                            )
+                            if is_discord_work_alert:
+                                prepared_alert = prepare_kanban_alert(
+                                    kind,
+                                    title=owner_title,
+                                    summary=owner_summary,
+                                    board=str(board_slug or ""),
+                                    project_id=kanban_project_subject(
+                                        str((task.project_id if task else "") or ""),
+                                        str((task.branch_name if task else "") or ""),
+                                    ),
+                                    metadata=metadata,
+                                    policy=alert_policy,
+                                )
+                            else:
+                                prepared_alert = None
+
                             if prepared_alert is not None:
-                                send_chat_id = prepared_alert.channel_id
                                 msg = prepared_alert.content
                                 metadata = dict(prepared_alert.metadata)
+                            else:
+                                msg = format_kanban_alert(
+                                    kind,
+                                    title=owner_title,
+                                    summary=owner_summary,
+                                )
+                                metadata = discord_alert_metadata(metadata)
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
@@ -773,7 +820,7 @@ class GatewayKanbanWatchersMixin:
                             # ``send_document`` / ``send_image_file`` uploads
                             # them. Only fires on the ``completed`` event so
                             # we never spam attachments on retries.
-                            if kind == "completed":
+                            if kind == "completed" and not is_discord_work_alert:
                                 try:
                                     await self._deliver_kanban_artifacts(
                                         adapter=adapter,

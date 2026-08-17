@@ -11,8 +11,14 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
+
+
+_WORK_CHANNEL = "111111111111111111"
+_PROJECT_WORK_CHANNEL = "222222222222222222"
+_NAMED_PROFILE_CHANNEL = "333333333333333333"
 
 
 # ---------------------------------------------------------------------------
@@ -836,6 +842,209 @@ def _sub_index(subs):
                 "notifier_profile": getattr(s, "notifier_profile", None),
             })
     return out
+
+
+def _write_discord_work_config(home, *, channel=_WORK_CHANNEL, routes=None):
+    route_lines = ""
+    if routes:
+        route_lines = "    kanban_routes:\n" + "".join(
+            f'      "{prefix}": "{channel}"\n'
+            for prefix, channel in routes.items()
+        )
+    (home / "config.yaml").write_text(
+        "gateway:\n"
+        "  discord_alerts:\n"
+        "    channels:\n"
+        f'      kanban: "{channel}"\n'
+        + route_lines,
+        encoding="utf-8",
+    )
+
+
+def test_create_from_tui_subscribes_origin_and_default_discord_work_feed(
+    monkeypatch, worker_env,
+):
+    home = Path(os.environ["HERMES_HOME"])
+    _write_discord_work_config(home)
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "desktop-session-abc")
+
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "desktop work feed",
+        "assignee": "peer",
+    }))
+
+    assert result["ok"] is True
+    assert result["subscribed"] is True
+    subs = _sub_index(_list_subs_for_task(result["task_id"]))
+    assert {(sub["platform"], sub["chat_id"]) for sub in subs} == {
+        ("tui", "desktop-session-abc"),
+        ("discord", _WORK_CHANNEL),
+    }
+    work = next(sub for sub in subs if sub["platform"] == "discord")
+    assert work["thread_id"] == ""
+    assert work["notifier_profile"] == "default"
+    assert work["delivery_metadata"] == {}
+
+
+def test_create_without_origin_context_still_subscribes_work_feed_without_history(
+    monkeypatch, worker_env,
+):
+    home = Path(os.environ["HERMES_HOME"])
+    _write_discord_work_config(home)
+    for key in (
+        "HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID",
+        "HERMES_SESSION_THREAD_ID", "HERMES_SESSION_USER_ID",
+        "HERMES_SESSION_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "headless work feed",
+        "assignee": "peer",
+    }))
+    task_id = result["task_id"]
+    assert result["subscribed"] is True
+
+    conn = kb.connect()
+    try:
+        # Re-registering the automatic subscription is duplicate-safe.
+        assert kt._maybe_auto_subscribe(conn, task_id, board="default") is True
+        subs = kb.list_notify_subs(conn, task_id)
+        assert len(subs) == 1
+        max_event_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0]
+        assert subs[0]["last_event_id"] == max_event_id
+    finally:
+        conn.close()
+
+
+def test_named_creator_reads_work_route_from_default_profile(
+    monkeypatch, worker_env,
+):
+    default_home = Path(os.environ["HERMES_HOME"])
+    _write_discord_work_config(default_home)
+    named_home = default_home / "profiles" / "builder"
+    named_home.mkdir(parents=True)
+    _write_discord_work_config(named_home, channel=_NAMED_PROFILE_CHANNEL)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(default_home / "kanban.db"))
+    monkeypatch.setenv("HERMES_HOME", str(named_home))
+    monkeypatch.setenv("HERMES_PROFILE", "builder")
+    for key in (
+        "HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "named creator default feed",
+        "assignee": "peer",
+    }))
+
+    subs = _sub_index(_list_subs_for_task(result["task_id"]))
+    assert [(sub["platform"], sub["chat_id"], sub["notifier_profile"]) for sub in subs] == [
+        ("discord", _WORK_CHANNEL, "default"),
+    ]
+
+
+def test_create_from_gateway_preserves_origin_and_adds_work_feed(
+    monkeypatch, worker_env,
+):
+    home = Path(os.environ["HERMES_HOME"])
+    _write_discord_work_config(home)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "owner-chat")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "origin-thread")
+
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "gateway dual delivery",
+        "assignee": "peer",
+    }))
+
+    subs = _sub_index(_list_subs_for_task(result["task_id"]))
+    assert len(subs) == 2
+    origin = next(sub for sub in subs if sub["platform"] == "telegram")
+    assert origin["chat_id"] == "owner-chat"
+    assert origin["thread_id"] == "origin-thread"
+    work = next(sub for sub in subs if sub["platform"] == "discord")
+    assert work["chat_id"] == _WORK_CHANNEL
+    assert work["thread_id"] == ""
+
+
+def test_project_work_route_replaces_generic_fallback_without_duplicate(
+    monkeypatch, worker_env, tmp_path,
+):
+    home = Path(os.environ["HERMES_HOME"])
+    _write_discord_work_config(
+        home,
+        routes={"cunicula*": _PROJECT_WORK_CHANNEL},
+    )
+    for key in (
+        "HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    repo = tmp_path / "cunicula-repo"
+    repo.mkdir()
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn,
+            name="Cunicula Site",
+            slug="cunicula-site",
+            primary_path=str(repo),
+        )
+    project_result = json.loads(kt._handle_create({
+        "title": "Cunicula work",
+        "assignee": "peer",
+        "project": "cunicula-site",
+    }))
+    project_task = project_result["task_id"]
+    assert project_result["project_id"] == project_id
+
+    conn = kb.connect()
+    try:
+        generic_task = kb.create_task(conn, title="Generic work", assignee="peer")
+        assert kt._maybe_auto_subscribe(
+            conn,
+            generic_task,
+            board="default",
+            project_id="other",
+        )
+        project_row = kb.get_task(conn, project_task)
+        assert project_row is not None
+        assert kt._maybe_auto_subscribe(
+            conn,
+            project_task,
+            board="default",
+            project_id=project_row.project_id or "",
+            branch_name=project_row.branch_name or "",
+        )
+    finally:
+        conn.close()
+
+    project_subs = _sub_index(_list_subs_for_task(project_task))
+    generic_subs = _sub_index(_list_subs_for_task(generic_task))
+    assert [(sub["platform"], sub["chat_id"]) for sub in project_subs] == [
+        ("discord", _PROJECT_WORK_CHANNEL),
+    ]
+    assert [(sub["platform"], sub["chat_id"]) for sub in generic_subs] == [
+        ("discord", _WORK_CHANNEL),
+    ]
 
 
 def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):

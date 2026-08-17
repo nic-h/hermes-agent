@@ -129,11 +129,12 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
     assert adapter.handled[0].source.thread_id == "20197"
 
 
-def test_discord_kanban_notification_routes_only_to_configured_update_channel(
+def test_discord_work_notification_is_human_bounded_and_never_uploads_artifacts(
     tmp_path, monkeypatch,
 ):
     from gateway.discord_alerts import DiscordAlertPolicy
     import gateway.discord_alerts as discord_alerts
+    work_channel = "111111111111111111"
 
     db_path = tmp_path / "discord-kanban-route.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -145,10 +146,34 @@ def test_discord_kanban_notification_routes_only_to_configured_update_channel(
             conn,
             task_id=tid,
             platform="discord",
-            chat_id="1535574257927716894",
-            thread_id="987654321098765432",
+            chat_id=work_channel,
+            notifier_profile="default",
+            delivery_metadata={
+                "thread_id": "987654321098765432",
+                "reply_to_message_id": "source-message",
+                "attachments": "huge-report.pdf",
+                "file_path": "/tmp/huge-report.pdf",
+                "chat_type": "channel",
+            },
         )
-        kb.complete_task(conn, tid, summary="done")
+        # A duplicate origin/work registration must remain one subscription
+        # and therefore one visible delivery.
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id=work_channel,
+            notifier_profile="default",
+        )
+        kb.complete_task(
+            conn,
+            tid,
+            summary=(
+                "Useful receipt. " + "x" * 1800
+                + " Kanban t_secret @worker dispatcher retry RuntimeError: raw"
+            ),
+            metadata={"artifacts": [str(tmp_path / "huge-report.pdf")]},
+        )
     finally:
         conn.close()
 
@@ -156,7 +181,7 @@ def test_discord_kanban_notification_routes_only_to_configured_update_channel(
         {
             "gateway": {
                 "discord_alerts": {
-                    "channels": {"kanban": "1535573028459773993"},
+                    "channels": {"kanban": work_channel},
                 }
             }
         }
@@ -166,15 +191,26 @@ def test_discord_kanban_notification_routes_only_to_configured_update_channel(
     adapter = RecordingAdapter()
     runner = _make_runner(adapter)
     runner.__dict__["adapters"] = {Platform.DISCORD: adapter}
+    artifact_calls = []
+
+    async def record_artifact_delivery(**kwargs):
+        artifact_calls.append(kwargs)
+
+    runner._deliver_kanban_artifacts = record_artifact_delivery
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1
-    assert adapter.sent[0]["chat_id"] == "1535573028459773993"
-    assert adapter.sent[0]["text"].startswith("What happened: DONE:")
+    assert adapter.sent[0]["chat_id"] == work_channel
+    assert adapter.sent[0]["text"].startswith("Done: Discord route")
+    assert "Useful receipt." in adapter.sent[0]["text"]
+    assert len(adapter.sent[0]["text"]) < 1200
+    for hidden in ("t_secret", "@worker", "dispatcher", "retry", "RuntimeError"):
+        assert hidden not in adapter.sent[0]["text"]
     assert adapter.sent[0]["metadata"] == {
         "non_conversational": True,
         "discord_no_mentions": True,
     }
+    assert artifact_calls == []
 
 
 def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
