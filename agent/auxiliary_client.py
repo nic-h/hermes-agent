@@ -1545,6 +1545,7 @@ class _CodexCompletionsAdapter:
                 _cache_scope_from_session_id,
                 _content_cache_key,
                 _default_prompt_cache_retention_for_request,
+                _supports_prompt_cache_key_for_request,
             )
             from utils import base_url_host_matches
 
@@ -1554,7 +1555,16 @@ class _CodexCompletionsAdapter:
                 base_url_host_matches(_host_src, "githubcopilot.com")
                 or base_url_host_matches(_host_src, "models.github.ai")
             )
-            if not _is_xai and not _is_github and "prompt_cache_key" not in resp_kwargs:
+            if (
+                not _is_xai
+                and not _is_github
+                and "prompt_cache_key" not in resp_kwargs
+                and _supports_prompt_cache_key_for_request(
+                    model,
+                    _host_src,
+                    is_codex_backend=base_url_host_matches(_host_src, "chatgpt.com"),
+                )
+            ):
                 # Scope by the owning turn's session so two unrelated sessions
                 # with the same instructions/tools (e.g. compression, MoA,
                 # flush_memories firing back-to-back on different sessions)

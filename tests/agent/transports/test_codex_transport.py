@@ -90,6 +90,33 @@ class TestCodexBuildKwargs:
         )
         assert kw1["prompt_cache_key"] != kw2["prompt_cache_key"]
 
+    @pytest.mark.parametrize("model", [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ])
+    def test_gpt56_codex_backend_omits_rejected_cache_key(self, transport, model):
+        kw = transport.build_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            session_id="test-session",
+            base_url="https://chatgpt.com/backend-api/codex",
+            is_codex_backend=True,
+        )
+        assert "prompt_cache_key" not in kw
+        assert "prompt_cache_retention" not in kw
+
+    def test_gpt56_direct_openai_keeps_cache_key(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            session_id="test-session",
+            base_url="https://api.openai.com/v1",
+        )
+        assert kw["prompt_cache_key"].startswith("pck_")
+
     def test_github_responses_drops_message_item_id_end_to_end(self, transport):
         # #32716: Copilot binds codex_message_items ids to a backend
         # "connection" that doesn't survive credential rotation, a gateway

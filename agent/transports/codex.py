@@ -134,6 +134,28 @@ def _default_prompt_cache_retention_for_request(
     return None
 
 
+def _supports_prompt_cache_key_for_request(
+    model: str,
+    base_url: Any,
+    *,
+    is_codex_backend: bool = False,
+) -> bool:
+    """Return whether the destination accepts ``prompt_cache_key``.
+
+    The ChatGPT Codex backend currently rejects GPT-5.6 family requests that
+    include the cache-routing key with a misleading
+    ``prompt_cache_retention is not supported`` HTTP 400. The key is only a
+    performance hint, so omit it for that exact endpoint/model combination
+    while retaining cache routing everywhere else.
+    """
+    from utils import base_url_hostname
+
+    hostname = base_url_hostname(str(base_url or ""))
+    normalized = str(model or "").strip().lower().replace("_", "-")
+    is_chatgpt_codex = is_codex_backend or hostname == "chatgpt.com"
+    return not (is_chatgpt_codex and normalized.startswith("gpt-5.6"))
+
+
 def _content_cache_key(
     instructions: str,
     tools: Optional[List[Dict[str, Any]]],
@@ -390,7 +412,16 @@ class ResponsesApiTransport(ProviderTransport):
         ) or _cache_scope
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.
-        if not is_github_responses and not is_xai_responses and cache_key:
+        if (
+            not is_github_responses
+            and not is_xai_responses
+            and cache_key
+            and _supports_prompt_cache_key_for_request(
+                model,
+                params.get("base_url"),
+                is_codex_backend=params.get("is_codex_backend") is True,
+            )
+        ):
             kwargs["prompt_cache_key"] = cache_key
 
         cache_retention = _default_prompt_cache_retention_for_request(
