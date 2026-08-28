@@ -11,12 +11,10 @@ The tool registers when **either** xAI credential path is available:
   i.e. ``hermes auth add xai-oauth`` has been run and the stored refresh
   token still works.
 
-Credential preference at call time matches
-:func:`tools.xai_http.resolve_xai_http_credentials`: SuperGrok OAuth first,
-direct OAuth resolver second, ``XAI_API_KEY`` last. That helper also
-auto-refreshes the OAuth access token when it's within the refresh skew
-window, so a ``True`` from :func:`check_x_search_requirements` means the
-bearer is fetchable AND non-empty.
+When ``x_search.credentials_file`` is configured, X Search reads only the
+paid API key in that file.  This keeps paid X-index calls separate from Grok
+subscription OAuth used for ordinary model inference.  Installations without
+that explicit setting retain the normal shared xAI credential resolver.
 
 Defensive output
 ----------------
@@ -46,6 +44,7 @@ import json
 import logging
 import time
 from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -119,6 +118,45 @@ def _get_x_search_retries() -> int:
 # Credential resolution
 # ---------------------------------------------------------------------------
 
+def _read_configured_x_search_key() -> Optional[Tuple[str, str, str]]:
+    """Return the explicitly isolated X Search credential when configured.
+
+    A configured-but-missing file fails closed.  Falling through to Grok OAuth
+    in that situation would violate the operator's billing separation and make
+    a typo unexpectedly consume the subscription allowance.
+    """
+    cfg = _load_x_search_config()
+    raw_path = str(cfg.get("credentials_file") or "").strip()
+    if not raw_path:
+        return None
+
+    path = Path(raw_path).expanduser()
+    key_name = str(cfg.get("credential_key") or "XAI_API_KEY").strip()
+    if not path.is_file():
+        raise RuntimeError(
+            f"Configured X Search credential file is missing: {path}"
+        )
+
+    api_key = ""
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        if name.strip() != key_name:
+            continue
+        api_key = value.strip().strip('"').strip("'")
+        break
+    if not api_key:
+        raise RuntimeError(
+            f"{key_name} is missing from configured X Search credential file: {path}"
+        )
+
+    base_url = str(
+        cfg.get("base_url") or DEFAULT_XAI_BASE_URL
+    ).strip().rstrip("/")
+    return api_key, base_url, "xai-search-dedicated"
+
 def _resolve_xai_bearer() -> Tuple[str, str, str]:
     """Return ``(api_key, base_url, source)``.
 
@@ -129,6 +167,10 @@ def _resolve_xai_bearer() -> Tuple[str, str, str]:
     check exists so a credential that expires between registration and
     invocation produces a clean tool error instead of a 401.
     """
+    configured = _read_configured_x_search_key()
+    if configured is not None:
+        return configured
+
     creds = resolve_xai_http_credentials()
     api_key = str(creds.get("api_key") or "").strip()
     if not api_key:
@@ -150,6 +192,9 @@ def check_x_search_requirements() -> bool:
     return therefore implies a usable bearer.
     """
     try:
+        configured = _read_configured_x_search_key()
+        if configured is not None:
+            return bool(configured[0])
         creds = resolve_xai_http_credentials()
         return bool(str(creds.get("api_key") or "").strip())
     except Exception:
@@ -344,7 +389,11 @@ def x_search_tool(
                 }
             ],
             "tools": [tool_def],
+            "tool_choice": "required",
             "store": False,
+            "max_tool_calls": 1,
+            "parallel_tool_calls": False,
+            "max_output_tokens": 512,
         }
         if reasoning_effort:
             payload["reasoning"] = {"effort": reasoning_effort}
@@ -362,7 +411,7 @@ def x_search_tool(
                         "User-Agent": hermes_xai_user_agent(),
                     },
                     json=payload,
-                    timeout=timeout_seconds,
+                    timeout=(10, timeout_seconds),
                 )
                 response.raise_for_status()
                 break

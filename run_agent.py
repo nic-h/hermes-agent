@@ -5958,11 +5958,20 @@ class AIAgent:
             self._client_kwargs["default_headers"] = _codex_cloudflare_headers(
                 self._client_kwargs.get("api_key", "")
             )
-        elif base_url_host_matches(base_url, "x.ai"):
-            # Cover both provider=xai and provider=xai-oauth (api.x.ai).
+        elif (
+            base_url_host_matches(base_url, "x.ai")
+            or base_url_host_matches(base_url, "cli-chat-proxy.grok.com")
+        ):
+            # Direct xAI API and the Grok CLI subscription proxy use
+            # different identifying headers.  The latter rejects or hides
+            # endpoints when sent the ordinary API client identity.
             from tools.xai_http import hermes_xai_default_headers
 
-            self._client_kwargs["default_headers"] = hermes_xai_default_headers()
+            self._client_kwargs["default_headers"] = hermes_xai_default_headers(
+                oauth_proxy=base_url_host_matches(
+                    base_url, "cli-chat-proxy.grok.com"
+                )
+            )
         else:
             # No URL-specific headers — check profile.default_headers before clearing.
             _ph_headers = None

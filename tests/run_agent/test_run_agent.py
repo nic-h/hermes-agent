@@ -5358,6 +5358,43 @@ class TestFallbackAnthropicProvider:
         assert agent._anthropic_client is not None
         assert agent.client is None
 
+    def test_fallback_to_named_anthropic_proxy_honors_config_transport(self, agent):
+        agent._fallback_activated = False
+        agent._fallback_model = {
+            "provider": "claude-proxy",
+            "model": "claude-fable-5",
+        }
+        agent._fallback_chain = [agent._fallback_model]
+        agent._fallback_index = 0
+
+        mock_client = MagicMock()
+        mock_client.base_url = "http://127.0.0.1:42069"
+        mock_client.api_key = "no-key-required"
+        config = {
+            "providers": {
+                "claude-proxy": {
+                    "base_url": "http://127.0.0.1:42069",
+                    "transport": "anthropic_messages",
+                    "api_mode": "anthropic_messages",
+                }
+            }
+        }
+
+        with (
+            patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)),
+            patch("agent.anthropic_adapter.build_anthropic_client") as mock_build,
+            patch("hermes_cli.config.load_config", return_value=config),
+        ):
+            mock_build.return_value = MagicMock()
+            result = agent._try_activate_fallback()
+
+        assert result is True
+        assert agent.provider == "claude-proxy"
+        assert agent.api_mode == "anthropic_messages"
+        assert agent._anthropic_base_url == "http://127.0.0.1:42069"
+        assert agent._anthropic_client is not None
+        assert agent.client is None
+
     def test_fallback_to_anthropic_enables_prompt_caching(self, agent):
         agent._fallback_activated = False
         agent._fallback_model = {"provider": "anthropic", "model": "claude-sonnet-4-20250514"}
@@ -5407,6 +5444,31 @@ def test_aiagent_uses_copilot_acp_client():
     assert mock_acp_client.call_args.kwargs["api_key"] == "copilot-acp"
     assert mock_acp_client.call_args.kwargs["command"] == "/usr/local/bin/copilot"
     assert mock_acp_client.call_args.kwargs["args"] == ["--acp", "--stdio"]
+
+
+def test_aiagent_uses_grok_cli_oauth_headers_for_subscription_proxy():
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI") as mock_openai,
+    ):
+        AIAgent(
+            api_key="oauth-test-token",
+            base_url="https://cli-chat-proxy.grok.com/v1",
+            provider="xai-oauth",
+            api_mode="codex_responses",
+            model="grok-4.6",
+            enabled_toolsets=[],
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    headers = mock_openai.call_args.kwargs["default_headers"]
+    assert headers["User-Agent"] == "xai-grok-workspace/1.0.5"
+    assert headers["X-XAI-Token-Auth"] == "xai-grok-cli"
+    assert headers["x-grok-client-version"] == "1.0.5"
+    assert headers["x-grok-client-identifier"] == "grok-shell"
 
 
 def test_quiet_spinner_allowed_with_explicit_print_fn(agent):

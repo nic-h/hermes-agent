@@ -242,6 +242,68 @@ def test_x_search_uses_xai_oauth_when_only_oauth_available(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer oauth-bearer-token"
 
 
+def test_x_search_configured_credential_file_isolated_from_oauth(
+    monkeypatch, tmp_path
+):
+    """An explicit X-search key must win without consulting Grok OAuth."""
+    from tools.x_search_tool import (
+        _resolve_xai_bearer,
+        check_x_search_requirements,
+    )
+
+    credential_file = tmp_path / "x-search-only.env"
+    credential_file.write_text("XAI_API_KEY=xai-search-only-test\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "tools.x_search_tool._load_x_search_config",
+        lambda: {
+            "credentials_file": str(credential_file),
+            "credential_key": "XAI_API_KEY",
+            "base_url": "https://api.x.ai/v1",
+        },
+    )
+    monkeypatch.setattr(
+        "tools.x_search_tool.resolve_xai_http_credentials",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("Grok OAuth/shared xAI resolver must not be consulted")
+        ),
+    )
+
+    assert check_x_search_requirements() is True
+    assert _resolve_xai_bearer() == (
+        "xai-search-only-test",
+        "https://api.x.ai/v1",
+        "xai-search-dedicated",
+    )
+
+
+def test_x_search_configured_missing_file_fails_closed(monkeypatch, tmp_path):
+    """A broken isolation config must not silently consume Grok OAuth."""
+    from tools.x_search_tool import (
+        _resolve_xai_bearer,
+        check_x_search_requirements,
+    )
+
+    missing_file = tmp_path / "missing.env"
+    monkeypatch.setattr(
+        "tools.x_search_tool._load_x_search_config",
+        lambda: {"credentials_file": str(missing_file)},
+    )
+    monkeypatch.setattr(
+        "tools.x_search_tool.resolve_xai_http_credentials",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("Grok OAuth/shared xAI resolver must not be consulted")
+        ),
+    )
+
+    assert check_x_search_requirements() is False
+    try:
+        _resolve_xai_bearer()
+    except RuntimeError as exc:
+        assert "credential file is missing" in str(exc)
+    else:
+        raise AssertionError("missing dedicated credential file must fail closed")
+
+
 def test_x_search_returns_tool_error_when_no_credentials(monkeypatch):
     """No credentials anywhere: tool returns a clear error, not a 401 from xAI."""
     from tools.registry import invalidate_check_fn_cache
@@ -311,4 +373,3 @@ def test_x_search_not_degraded_when_no_filters_active(monkeypatch):
     assert result["success"] is True
     assert result["degraded"] is False
     assert result["degraded_reason"] is None
-

@@ -101,14 +101,23 @@ def hermes_xai_user_agent() -> str:
     return f"Hermes-Agent/{__version__}"
 
 
-def hermes_xai_default_headers() -> Dict[str, str]:
+def hermes_xai_default_headers(*, oauth_proxy: bool = False) -> Dict[str, str]:
     """Default headers for OpenAI-SDK and raw HTTP clients talking to xAI.
 
     Replaces the OpenAI Python SDK's identifying ``User-Agent: OpenAI/Python …``
     so chat/completions and Responses traffic is attributed as Hermes Agent,
     matching the direct HTTP integrations (search, TTS, STT, image, video).
     """
-    return {"User-Agent": hermes_xai_user_agent()}
+    if not oauth_proxy:
+        return {"User-Agent": hermes_xai_user_agent()}
+
+    version = str(get_env_value("HERMES_GROK_CLI_VERSION") or "1.0.5").strip()
+    return {
+        "User-Agent": f"xai-grok-workspace/{version}",
+        "X-XAI-Token-Auth": "xai-grok-cli",
+        "x-grok-client-version": version,
+        "x-grok-client-identifier": "grok-shell",
+    }
 
 
 def _load_config_section(section_name: str) -> Dict[str, Any]:
@@ -292,11 +301,11 @@ def resolve_xai_http_credentials(
             getattr(entry, "runtime_api_key", None)
             or getattr(entry, "access_token", "")
         ).strip()
-        fallback_base_url = str(
-            getattr(entry, "runtime_base_url", None)
-            or getattr(entry, "base_url", "")
-            or auth_mod.DEFAULT_XAI_OAUTH_BASE_URL
-        ).strip().rstrip("/")
+        # Older pool entries persisted api.x.ai before xAI moved subscription
+        # OAuth inference to the Grok CLI proxy.  Do not let that stale value
+        # override the current OAuth default; explicit validated env overrides
+        # remain supported below.
+        fallback_base_url = auth_mod.DEFAULT_XAI_OAUTH_BASE_URL
         override_base_url = str(
             get_env_value("HERMES_XAI_BASE_URL")
             or get_env_value("XAI_BASE_URL")

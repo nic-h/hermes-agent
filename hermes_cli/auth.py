@@ -122,7 +122,7 @@ ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120       # refresh 2 min before expiry
 NOUS_INVOKE_JWT_MIN_TTL_SECONDS = ACCESS_TOKEN_REFRESH_SKEW_SECONDS
 DEVICE_AUTH_POLL_INTERVAL_CAP_SECONDS = 1     # poll at most every 1s
 DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
-DEFAULT_XAI_OAUTH_BASE_URL = "https://api.x.ai/v1"
+DEFAULT_XAI_OAUTH_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 MINIMAX_OAUTH_CLIENT_ID = "78257093-7e40-4613-99e0-527b14b39113"
 MINIMAX_OAUTH_SCOPE = "group_id profile model.completion"
 MINIMAX_OAUTH_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:user_code"
@@ -4800,9 +4800,9 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
     token to a third party on every request, silently.
 
     Pin the inference origin to ``api.x.ai`` (or any ``*.x.ai`` subdomain xAI
-    may add). On rejection, fall back to the default and log a warning rather
-    than raise — a bad env var should not deadlock authentication, but it
-    should also never leak the bearer.
+    may add) and xAI's official Grok CLI proxy. On rejection, fall back to the
+    default and log a warning rather than raise — a bad env var should not
+    deadlock authentication, but it should also never leak the bearer.
 
     ``value`` is the already-stripped, trailing-slash-trimmed candidate from
     env. Empty input returns ``fallback`` unchanged.
@@ -4832,12 +4832,18 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
             candidate, fallback,
         )
         return fallback
-    if host != "x.ai" and not host.endswith(".x.ai"):
+    allowed_host = (
+        host == "x.ai"
+        or host.endswith(".x.ai")
+        or host == "cli-chat-proxy.grok.com"
+    )
+    if not allowed_host:
         logger.warning(
             "Refusing xAI base_url override %r — host %r is not on the xAI origin "
-            "(expected x.ai or a *.x.ai subdomain). The xai-oauth bearer is only "
-            "valid against xAI's inference API; sending it elsewhere would leak "
-            "the credential. Falling back to %s.",
+            "(expected x.ai, a *.x.ai subdomain, or the official Grok CLI "
+            "proxy). The xai-oauth bearer is only valid against xAI's "
+            "inference services; sending it elsewhere would leak the "
+            "credential. Falling back to %s.",
             candidate, host, fallback,
         )
         return fallback

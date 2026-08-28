@@ -2061,11 +2061,53 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_model, fb_provider, _norm_err,
             )
 
-        # Determine api_mode from provider / base URL / model
-        fb_api_mode = "chat_completions"
+        # Determine api_mode from provider / base URL / model.  Named user
+        # providers can declare their wire protocol in config.yaml; honor that
+        # before applying hostname heuristics.  Without this, an Anthropic
+        # proxy such as ``claude-proxy`` is rebuilt as an OpenAI client and
+        # receives POST /chat/completions even though it only exposes
+        # /v1/messages.
+        fb_api_mode = ""
         fb_base_url = str(fb_client.base_url)
+        try:
+            from hermes_cli.config import load_config as _load_fallback_config
+            from hermes_cli.providers import (
+                TRANSPORT_TO_API_MODE,
+                resolve_user_provider,
+            )
+
+            _fallback_cfg = _load_fallback_config() or {}
+            _provider_cfg = _fallback_cfg.get("providers") or {}
+            _user_provider = resolve_user_provider(fb_provider, _provider_cfg)
+            _raw_configured_mode = ""
+            if isinstance(_provider_cfg, dict):
+                _raw_provider_cfg = _provider_cfg.get(fb_provider)
+                if isinstance(_raw_provider_cfg, dict):
+                    _raw_configured_mode = str(
+                        _raw_provider_cfg.get("api_mode") or ""
+                    ).strip()
+            if _raw_configured_mode in {
+                "chat_completions",
+                "codex_responses",
+                "anthropic_messages",
+                "bedrock_converse",
+            }:
+                fb_api_mode = _raw_configured_mode
+            elif _user_provider is not None:
+                fb_api_mode = TRANSPORT_TO_API_MODE.get(
+                    _user_provider.transport, "chat_completions"
+                )
+        except Exception as _provider_mode_err:
+            logger.debug(
+                "Could not resolve configured fallback transport for %s: %s",
+                fb_provider,
+                _provider_mode_err,
+            )
+
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
-        if fb_provider == "openai-codex":
+        if fb_api_mode:
+            pass
+        elif fb_provider == "openai-codex":
             fb_api_mode = "codex_responses"
         elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
             # Portal is dual-wire: anthropic/* must land on /v1/messages.
@@ -2106,6 +2148,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             and base_url_host_matches(fb_base_url, "amazonaws.com")
         ):
             fb_api_mode = "bedrock_converse"
+        else:
+            fb_api_mode = "chat_completions"
 
         old_model = agent.model
         old_provider = agent.provider
